@@ -1,2 +1,14 @@
 .idea/
 
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+
+# OS noise
+.DS_Store
+
