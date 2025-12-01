@@ -1,0 +1,381 @@
+utterance,intent
+hi,greet
+good morning,greet
+hey there,greet
+hello,greet
+hi bot,greet
+good afternoon,greet
+good evening,greet
+yo,greet
+hiya,greet
+hey what's up,greet
+are you there?,greet
+greetings,greet
+good day to you,greet
+hey,greet
+hello there,greet
+hi how are u,greet
+sup,greet
+anyone home?,greet
+morning,greet
+afternoon,greet
+what time are you open today?,ask_opening_hours
+when do you close?,ask_opening_hours
+are you open right now?,ask_opening_hours
+opening times please,ask_opening_hours
+what are your hours?,ask_opening_hours
+when does the shop open?,ask_opening_hours
+tell me when u close,ask_opening_hours
+are you open on sundays?,ask_opening_hours
+what time do you shut?,ask_opening_hours
+closing time?,ask_opening_hours
+hours of operation,ask_opening_hours
+is the cafe open atm?,ask_opening_hours
+when can i buy coffee?,ask_opening_hours
+time open?,ask_opening_hours
+when do u guys open tmrw,ask_opening_hours
+are u open late?,ask_opening_hours
+what time is last orders?,ask_opening_hours
+business hours,ask_opening_hours
+when do you open in the morning?,ask_opening_hours
+are you closed yet?,ask_opening_hours
+which allergens do you check for?,ask_allergens_general
+do you have an allergen list?,ask_allergens_general
+is your menu safe for nut allergies?,ask_allergens_general
+allergy info pls,ask_allergens_general
+what allergens are in your kitchen?,ask_allergens_general
+i have severe allergies is it safe here?,ask_allergens_general
+do you handle peanuts?,ask_allergens_general
+show me allergy guide,ask_allergens_general
+tell me about allergens,ask_allergens_general
+where can i see allergy info,ask_allergens_general
+is there cross contamination?,ask_allergens_general
+do u do allergy checks?,ask_allergens_general
+food safety info,ask_allergens_general
+im allergic to dairy is it safe?,ask_allergens_general
+list of allergens checked,ask_allergens_general
+do you use soya products?,ask_allergens_general
+allergen matrix,ask_allergens_general
+i need to check ingredients for allergies,ask_allergens_general
+are there allergens in the food?,ask_allergens_general
+allergy warning,ask_allergens_general
+does the Starbucks Misto oat contain milk?,ask_item_allergens
+is your Costa Express hot chocolate suitable for vegans?,ask_item_allergens
+does the latte have nuts in it?,ask_item_allergens
+is there gluten in the muffin?,ask_item_allergens
+contains dairy?,ask_item_allergens
+does the cookie have egg?,ask_item_allergens
+is the misto safe for soy allergy?,ask_item_allergens
+any peanuts in the brownie?,ask_item_allergens
+does the hot choc contain milk powder?,ask_item_allergens
+are there almonds in the croissant?,ask_item_allergens
+is the wrap dairy free?,ask_item_allergens
+does the sandwich have mustard?,ask_item_allergens
+is the soup celery free?,ask_item_allergens
+does the cake contain wheat?,ask_item_allergens
+ingredients in the mocha?,ask_item_allergens
+is the syrup nut free?,ask_item_allergens
+check allergens for cappuccino,ask_item_allergens
+does this drink have lactose?,ask_item_allergens
+is the flat white safe for nut allergy?,ask_item_allergens
+what is in the smoothie?,ask_item_allergens
+"I’m vegan, what can I drink here?",ask_vegan_options
+do you have vegan milk?,ask_vegan_options
+vegan options pls,ask_vegan_options
+is there a plant based menu?,ask_vegan_options
+i don't eat animal products what can i have,ask_vegan_options
+any vegan cakes?,ask_vegan_options
+do u have oat milk?,ask_vegan_options
+is the hot chocolate vegan?,ask_vegan_options
+dairy free alternatives,ask_vegan_options
+what foods are vegan friendly?,ask_vegan_options
+can i get a vegan latte?,ask_vegan_options
+im vegan show menu,ask_vegan_options
+do you serve soya milk?,ask_vegan_options
+coconut milk options?,ask_vegan_options
+is the whipped cream vegan?,ask_vegan_options
+vegan snacks,ask_vegan_options
+plant based drinks list,ask_vegan_options
+vegan food options,ask_vegan_options
+anything for vegans?,ask_vegan_options
+do you have almond milk?,ask_vegan_options
+do you have any halal-friendly food options?,ask_halal_options
+is the meat halal?,ask_halal_options
+is the chicken halal certified?,ask_halal_options
+halal menu pls,ask_halal_options
+does this contain pork?,ask_halal_options
+is there alcohol in this?,ask_halal_options
+halal options,ask_halal_options
+can muslims eat here?,ask_halal_options
+is the beef halal?,ask_halal_options
+any pork products?,ask_halal_options
+is the gelatin halal?,ask_halal_options
+halal friendly snacks,ask_halal_options
+which sandwiches are halal?,ask_halal_options
+do you serve bacon?,ask_halal_options
+is the turkey halal?,ask_halal_options
+halal certification?,ask_halal_options
+i only eat halal,ask_halal_options
+are the marshmallows halal?,ask_halal_options
+contains haram ingredients?,ask_halal_options
+is the pepperoni halal?,ask_halal_options
+"I need something without gluten, what do you recommend?",ask_gluten_free
+gf options,ask_gluten_free
+is there a gluten free menu?,ask_gluten_free
+do you have gf bread?,ask_gluten_free
+celiac friendly food,ask_gluten_free
+gluten free cakes?,ask_gluten_free
+im intolerant to gluten what can i eat,ask_gluten_free
+does the soup have flour?,ask_gluten_free
+wheat free options,ask_gluten_free
+is the brownie gluten free?,ask_gluten_free
+any gf snacks?,ask_gluten_free
+can i get this without the bun?,ask_gluten_free
+gluten free sandwiches?,ask_gluten_free
+is the oatmeal gf?,ask_gluten_free
+do you worry about cross contamination for gluten?,ask_gluten_free
+flourless cake,ask_gluten_free
+which items are gluten free?,ask_gluten_free
+is the cookie gf?,ask_gluten_free
+gluten intolerance options,ask_gluten_free
+safe for celiacs?,ask_gluten_free
+how many calories are in a grande latte with vanilla syrup?,ask_calories
+calorie count pls,ask_calories
+is this high calorie?,ask_calories
+how much sugar in this?,ask_calories
+nutritional info,ask_calories
+whats the cals in a muffin,ask_calories
+is this fattening?,ask_calories
+calories in a cappuccino?,ask_calories
+macros for the sandwich,ask_calories
+how many kcal,ask_calories
+diet coke calories?,ask_calories
+is this low fat?,ask_calories
+sugar content in hot chocolate,ask_calories
+energy value,ask_calories
+cals in tall misto,ask_calories
+nutritional values,ask_calories
+calories please,ask_calories
+is the cake high in sugar?,ask_calories
+how many calories in oat milk?,ask_calories
+check calories,ask_calories
+add a tall Misto with oat milk to my order,add_to_cart
+i want to buy a coffee,add_to_cart
+get me a grande latte,add_to_cart
+add a blueberry muffin,add_to_cart
+one cappuccino pls,add_to_cart
+can i have a tea,add_to_cart
+add 2 cookies to cart,add_to_cart
+i'll take the costa express hot choc,add_to_cart
+put a sandwich in my basket,add_to_cart
+order a flat white,add_to_cart
+add extra shot espresso,add_to_cart
+buy a water bottle,add_to_cart
+add item to cart,add_to_cart
+give me a mocha,add_to_cart
+add vanilla syrup,add_to_cart
+i want that one,add_to_cart
+add a croissant,add_to_cart
+plus one latte,add_to_cart
+ill have a medium americano,add_to_cart
+add to order,add_to_cart
+remove the blueberry muffin from my cart,remove_from_cart
+delete that item,remove_from_cart
+take the coffee out,remove_from_cart
+i changed my mind remove the cookie,remove_from_cart
+remove item,remove_from_cart
+empty cart,remove_from_cart
+actually i dont want the tea,remove_from_cart
+cancel the muffin,remove_from_cart
+remove last item,remove_from_cart
+delete my order,remove_from_cart
+take it out of the basket,remove_from_cart
+remove the misto,remove_from_cart
+drop the sandwich,remove_from_cart
+clear basket,remove_from_cart
+remove from order,remove_from_cart
+mistake remove that,remove_from_cart
+dont want it anymore,remove_from_cart
+delete the latte pls,remove_from_cart
+remove the syrup,remove_from_cart
+undo add,remove_from_cart
+what’s in my cart right now?,show_cart
+show me my order,show_cart
+view basket,show_cart
+what have i ordered?,show_cart
+list cart items,show_cart
+check my cart,show_cart
+display order,show_cart
+how much is my total?,show_cart
+whats in the bag,show_cart
+cart status,show_cart
+review order,show_cart
+show cart pls,show_cart
+what did i add?,show_cart
+see basket,show_cart
+cart contents,show_cart
+show me the list,show_cart
+verify order,show_cart
+basket check,show_cart
+do i have the muffin in there?,show_cart
+current order,show_cart
+go to checkout,checkout
+i want to pay,checkout
+checkout now,checkout
+finish order,checkout
+pay for items,checkout
+done ordering,checkout
+ready to pay,checkout
+can i check out?,checkout
+finalize order,checkout
+payment page,checkout
+where do i pay?,checkout
+checkout pls,checkout
+complete purchase,checkout
+im done,checkout
+pay now,checkout
+process payment,checkout
+check out cart,checkout
+buy now,checkout
+wrap it up,checkout
+go to payment,checkout
+"my name is Ali, remember that",change_user_name
+call me John,change_user_name
+change my name to Sarah,change_user_name
+i am David,change_user_name
+my name is actually Sam,change_user_name
+please call me Mo,change_user_name
+set my name to user1,change_user_name
+update my name,change_user_name
+refer to me as Boss,change_user_name
+names James,change_user_name
+im Emily,change_user_name
+you can call me T,change_user_name
+change user name to Bob,change_user_name
+remember my name is Fatima,change_user_name
+call me something else,change_user_name
+my name is Abdullah,change_user_name
+new name is Chris,change_user_name
+reset name to Alex,change_user_name
+stop calling me that call me Ben,change_user_name
+set name,change_user_name
+From now on I'll call you BrewBot,change_bot_name
+change your name to Jarvis,change_bot_name
+i want to name you CoffeeBot,change_bot_name
+your name is now Helper,change_bot_name
+rename bot to Butler,change_bot_name
+can i change your name?,change_bot_name
+set bot name to X,change_bot_name
+im calling you Steve,change_bot_name
+you are now Rob,change_bot_name
+new name for you,change_bot_name
+bot rename,change_bot_name
+call yourself Java,change_bot_name
+change name to Barista,change_bot_name
+i dub thee Sir Coffee,change_bot_name
+your name is stupid change it,change_bot_name
+rename yourself,change_bot_name
+set nickname,change_bot_name
+i'll call you Botty,change_bot_name
+update bot name,change_bot_name
+name change,change_bot_name
+"thanks, that really helped",user_thanks
+thank you,user_thanks
+thx,user_thanks
+cheers,user_thanks
+thanks a lot,user_thanks
+appreciate it,user_thanks
+nice one,user_thanks
+thank u,user_thanks
+ty,user_thanks
+thanks bot,user_thanks
+cool thanks,user_thanks
+very helpful thanks,user_thanks
+awesome thanks,user_thanks
+ok thanks,user_thanks
+thanks for the help,user_thanks
+great thanks,user_thanks
+perfect thanks,user_thanks
+youre a star thanks,user_thanks
+ta,user_thanks
+much appreciated,user_thanks
+"this is useless, I’m really annoyed",user_angry
+im annoyed,user_angry
+this sucks,user_angry
+so frustrating,user_angry
+you are annoying me,user_angry
+waste of time,user_angry
+this is garbage,user_angry
+i hate this app,user_angry
+not helpful at all,user_angry
+rubbish service,user_angry
+why is this so hard,user_angry
+this is broken,user_angry
+im getting angry,user_angry
+stupid thing,user_angry
+pointless,user_angry
+this is awful,user_angry
+ridiculous,user_angry
+fed up with this,user_angry
+ugh,user_angry
+worst bot ever,user_angry
+you are stupid,user_insult
+idiot,user_insult
+shut up,user_insult
+you suck,user_insult
+go away,user_insult
+dumb bot,user_insult
+moron,user_insult
+youre useless,user_insult
+f off,user_insult
+stupid bot,user_insult
+get lost,user_insult
+you are crazy,user_insult
+imbecile,user_insult
+hate you,user_insult
+you are the worst,user_insult
+ugly bot,user_insult
+shut your mouth,user_insult
+dont talk to me,user_insult
+loser,user_insult
+you know nothing,user_insult
+I want to book a flight to Paris,out_of_scope
+what is the weather in London?,out_of_scope
+who won the football match?,out_of_scope
+help me with my homework,out_of_scope
+tell me a joke,out_of_scope
+how do i fix my car?,out_of_scope
+play music,out_of_scope
+what is the meaning of life?,out_of_scope
+call my mum,out_of_scope
+what time is the movie?,out_of_scope
+book a hotel,out_of_scope
+politics news,out_of_scope
+solve this math problem,out_of_scope
+how to cook pasta,out_of_scope
+where is the nearest bank?,out_of_scope
+order a pizza from dominos,out_of_scope
+sing a song,out_of_scope
+whats 2+2?,out_of_scope
+who is the president?,out_of_scope
+rent a car,out_of_scope
+this isn't working properly,user_complaint
+your app is really confusing,user_complaint
+i'm not happy with this service,user_complaint
+this chatbot is not helping me,user_complaint
+i have a complaint about my order,user_complaint
+i want to make a complaint,user_complaint
+i'd like to report a problem,user_complaint
+i'm not satisfied with this,user_complaint
+complaint,user_complaint
+who do i complain to?,user_complaint
+service was bad,user_complaint
+my coffee was cold yesterday,user_complaint
+wrong order received,user_complaint
+slow service,user_complaint
+the app crashed,user_complaint
+i want a refund,user_complaint
+speak to a manager,user_complaint
+report a bug,user_complaint
+bad experience,user_complaint
+file a grievance,user_complaint
