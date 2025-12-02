@@ -87,6 +87,22 @@ class DialogueManager:
     the returned text.
     """
 
+    GREET_KEYWORDS = {
+        "hi","hello","hey","good morning","good afternoon",
+        "good evening","hiya","yo","morning","afternoon",
+    }
+
+    ANGRY_KEYWORDS = {
+        "annoyed", "useless", "waste of time", "frustrating",
+        "fed up", "awful", "ridiculous", "worst bot", "not happy",
+        "not satisfied", "bad experience", "rubbish",
+    }
+
+    INSULT_KEYWORDS = {
+        "stupid", "idiot", "dumb bot", "moron", "useless",
+        "hate you", "loser", "ugly bot", "shut up", "f off",
+    }
+
     def __init__(
         self,
         intent_classifier: SklearnIntentClassifier,
@@ -155,12 +171,39 @@ class DialogueManager:
         ):
             return self._handle_change_bot_name(raw)
 
+        if "what can you do" in lowered or "what do you do" in lowered:
+            return (
+                "I can help with café questions, such as: allergens, vegan/halal/gluten-free options, "
+                "calories calculations, and managing your order – adding/removing items, "
+                "showing your cart, and checking out."
+            )
+
+        if lowered.startswith("who is ") or lowered.startswith("who's "):
+            return self._handle_out_of_scope(raw)
+
+        if lowered.startswith("who are ") or lowered.startswith("who're "):
+            return self._handle_out_of_scope(raw)
+
+        if lowered.startswith("do you know who "):
+            return self._handle_out_of_scope(raw)
+
+        for g in self.GREET_KEYWORDS:
+            # Match the greeting as a whole word at the start, e.g. "yo" but not "you"
+            pattern = r"^" + re.escape(g) + r"\b"
+            if re.match(pattern, lowered):
+                return self._handle_greet(raw)
+
         # 2) Intent detection
         intent_label, confidence = self.intent_classifier.predict_intent(raw)
         self.state.last_intent = intent_label
 
-        if confidence < self.config.intent_confidence_threshold:
-            # Low confidence → generic fallback
+        if intent_label is None or confidence < self.config.intent_confidence_threshold:
+            # Try insult / angry keywords before a generic fallback
+            if any(kw in lowered for kw in self.INSULT_KEYWORDS):
+                return self._handle_user_insult(raw)
+            if any(kw in lowered for kw in self.ANGRY_KEYWORDS):
+                return self._handle_user_angry(raw)
+            # Otherwise: generic fallback
             return self._handle_fallback(raw)
 
         # 3) Dispatch to intent-specific handlers
@@ -569,9 +612,9 @@ class DialogueManager:
 
     def _handle_out_of_scope(self, _: str) -> str:
         return (
-            "I can’t help with that request (like booking flights), "
-            "but I can answer questions about drinks, allergens, vegan/halal options, "
-            "and manage your cart and checkout."
+            "I can’t help with that kind of question – I’m just a café assistant. "
+            "I can answer questions about drinks, allergens, vegan/halal/gluten-free options, "
+            "and manage your order (cart and checkout)."
         )
 
 

@@ -359,6 +359,10 @@ sing a song,out_of_scope
 whats 2+2?,out_of_scope
 who is the president?,out_of_scope
 rent a car,out_of_scope
+do you know max verstappen?,out_of_scope
+do you know who florentino perez is?,out_of_scope
+do you know lewis hamilton?,out_of_scope
+do you know any football players?,out_of_scope
 this isn't working properly,user_complaint
 your app is really confusing,user_complaint
 i'm not happy with this service,user_complaint
