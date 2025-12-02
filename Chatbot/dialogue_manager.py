@@ -103,6 +103,37 @@ class DialogueManager:
         "hate you", "loser", "ugly bot", "shut up", "f off",
     }
 
+    # NEW: tokens we ignore when fuzzy-matching menu items,
+    # so generic words like "milk" or "contains" don't cause bad matches.
+    MATCH_STOPWORDS = {
+        # generic function words
+        "do", "does", "did", "is", "are", "was", "were",
+        "the", "a", "an", "this", "that", "these", "those",
+        "with", "without", "of", "for", "to", "in", "on", "at",
+        "my", "your", "our", "their", "its", "it", "i", "you", "we", "they",
+        "please", "pls", "can", "could", "would", "will", "shall", "should",
+        "any", "some", "just",
+        "what", "which", "how", "many", "much",
+
+        # allergen / question words that shouldn't drive item matching
+        "contains", "contain", "containing",
+        "has", "have", "having",
+        "allergen", "allergens", "allergy", "allergic",
+        "safe", "suitable", "free",
+        "info", "information", "list", "menu", "guide",
+        "check", "show", "tell",
+        "ingredients",
+
+        # allergy / nutrition meta words
+        "gluten",
+        "calorie", "calories", "kcal",
+        "sugar", "fat", "fats", "fatty",
+        "vegan", "veg", "vegetarian", "veggie",
+
+        # cart / container words (not part of item name)
+        "cart", "basket", "order", "bag",
+    }
+
     def __init__(
         self,
         intent_classifier: SklearnIntentClassifier,
@@ -113,6 +144,7 @@ class DialogueManager:
         self.intent_classifier = intent_classifier
         self.faq_engine = faq_engine
         self.menu_items = list(menu_items)
+        self._menu_vocab = self._build_menu_vocab(self.menu_items)
         self.config = config or ChatbotConfig()
         self.state = ConversationState()
 
@@ -177,6 +209,9 @@ class DialogueManager:
                 "calories calculations, and managing your order – adding/removing items, "
                 "showing your cart, and checking out."
             )
+
+        if re.search(r"\bput\b.+\b(basket|cart|order)\b", lowered):
+            return self._handle_add_to_cart(raw)
 
         if lowered.startswith("who is ") or lowered.startswith("who's "):
             return self._handle_out_of_scope(raw)
@@ -470,8 +505,32 @@ class DialogueManager:
             "Please check item details or ask staff if unsure."
         )
 
-    def _handle_gluten_free(self, _: str) -> str:
-        # Use coeliac-focused FAQ if present
+    def _handle_gluten_free(self, user_text: str) -> str:
+        """
+        Answer gluten-free questions.
+
+        - If we can safely match a specific menu item, return its full
+          allergen info via _format_item_allergen_answer.
+        - If the question *mentions* menu-like tokens but we can't safely
+          match, we give the same "unknown item" message as other
+          allergen queries (rather than pretending we know).
+        - Otherwise, treat it as a general gluten-free menu question and
+          fall back to the coeliac FAQ / generic guidance.
+        """
+        # 1) Try specific item match first
+        item = self._find_menu_item_in_text(user_text)
+        if item is not None:
+            return self._format_item_allergen_answer(item)
+
+        # 2) Looks item-specific but we couldn't safely match
+        if self._looks_like_item_query(user_text):
+            return (
+                "I couldn’t be sure which item you mean. "
+                "Try using the exact drink or food name as shown in the app, "
+                "for example “Chocolate Brownie” or “Caffè Latte”."
+            )
+
+        # 3) General gluten-free question → FAQ based answer
         match = self.faq_engine.get_faq_by_id("coeliac_safe_menu")
         if match:
             return match.answer_markdown
@@ -625,51 +684,186 @@ class DialogueManager:
     def _handle_fallback(self, _: str) -> str:
         return random.choice(FALLBACK_MESSAGES)
 
+    def _tokenise_for_matching(self, s: str) -> List[str]:
+        """
+        Tokeniser used for fuzzy menu matching:
+        - lowercases
+        - normalises a few synonyms (e.g. 'choc' -> 'chocolate')
+        - drops MATCH_STOPWORDS
+        """
+        TOKEN_NORMALISATIONS = {
+            "choc": "chocolate",  # so "hot choc" matches "Hot Chocolate"
+            "soy": "soya",  # treat "soy" the same as "soya"
+        }
+
+        tokens: List[str] = []
+        for raw in re.findall(r"[a-z0-9]+", (s or "").lower()):
+            norm = TOKEN_NORMALISATIONS.get(raw, raw)
+            if norm and norm not in self.MATCH_STOPWORDS:
+                tokens.append(norm)
+        return tokens
+
+    def _build_menu_vocab(self, items: Sequence[MenuItem]) -> set:
+        """
+        Build a vocabulary of tokens that appear in any menu item
+        (brand + name), used to spot when a question looks item-specific.
+        """
+        vocab: set = set()
+        for item in items:
+            candidate_text = f"{getattr(item, 'brand', '')} {getattr(item, 'name', '')}"
+            for tok in self._tokenise_for_matching(candidate_text):
+                vocab.add(tok)
+        return vocab
+
+    def _looks_like_item_query(self, user_text: str) -> bool:
+        """
+        Heuristic: does this text mention any token that exists in the menu?
+        Used to decide whether a gluten-free question is about a *specific*
+        item vs general GF advice.
+        """
+        tokens = set(self._tokenise_for_matching(user_text or ""))
+        if not tokens:
+            return False
+        return any(t in self._menu_vocab for t in tokens)
+
     def _find_menu_item_in_text(self, user_text: str) -> Optional[MenuItem]:
         """
         Fuzzy name matching:
 
-        - Tokenise both user text and item names (letters/digits only).
-        - Compute how many tokens overlap.
-        - Pick the item with the highest overlap, as long as
-          the overlap is at least 2 tokens.
+        - Tokenise both user text and item names (letters/digits only),
+          with MATCH_STOPWORDS removed and simple synonym normalisation
+          (e.g. "choc" -> "chocolate").
+        - Only keep user tokens that appear somewhere in the menu vocab.
+        - Compute token overlap between user and each item (brand + name).
+        - Pick the item(s) with the highest overlap, then break ties with
+          some safety-aware heuristics.
 
-        This makes things like "Misto oat" match
-        "Misto - oat drink" reliably.
+        Safety rules:
+        - If there is only a 1-token overlap and the question also contains
+          extra tokens that never appear in the menu (e.g. "unicorn latte"),
+          we treat it as an unknown drink (return None).
+        - We only allow a 1-token match when *all* user tokens are "menu-ish".
         """
         text = (user_text or "").lower()
         if not text:
             return None
 
-        # Simple tokeniser: letters/numbers only
-        def tokens(s: str) -> List[str]:
-            return [t for t in re.findall(r"[a-z0-9]+", s.lower()) if t]
-
-        user_tokens = set(tokens(text))
-        if not user_tokens:
+        user_tokens_all = set(self._tokenise_for_matching(text))
+        if not user_tokens_all:
             return None
 
-        best_item: Optional[MenuItem] = None
-        best_score: int = 0
+        # Only keep user tokens that appear somewhere in the menu
+        recognised_tokens = {t for t in user_tokens_all if t in self._menu_vocab}
+        if not recognised_tokens:
+            return None
+
+        # Find all items with the maximum overlap
+        best_overlap = 0
+        candidates: List[tuple[MenuItem, set[str]]] = []
 
         for item in self.menu_items:
-            name = (item.name or "").lower()
+            name = getattr(item, "name", "")
             if not name:
                 continue
-            item_tokens = set(tokens(name))
+
+            candidate_text = f"{getattr(item, 'brand', '')} {name}"
+            item_tokens = set(self._tokenise_for_matching(candidate_text))
             if not item_tokens:
                 continue
 
-            overlap = len(user_tokens & item_tokens)
-            if overlap > best_score:
-                best_score = overlap
-                best_item = item
+            overlap = len(recognised_tokens & item_tokens)
+            if overlap == 0:
+                continue
 
-        # Require at least 2 overlapping tokens to avoid wild matches
-        if best_item is None or best_score < 2:
+            if overlap > best_overlap:
+                best_overlap = overlap
+                candidates = [(item, item_tokens)]
+            elif overlap == best_overlap:
+                candidates.append((item, item_tokens))
+
+        if best_overlap == 0 or not candidates:
             return None
 
-        return best_item
+        # If we only have 1-token overlap but there are extra unknown tokens
+        # (e.g. "unicorn latte"), treat as suspicious and refuse to match.
+        unknown_tokens = user_tokens_all - recognised_tokens
+        if best_overlap == 1 and unknown_tokens:
+            return None
+
+        # At this point we have one or more "best" candidates that are
+        # safe to consider. Use tie-breaking to pick the best one.
+        return self._break_tie(user_tokens_all, recognised_tokens, candidates)
+
+    def _break_tie(
+        self,
+        user_tokens_all: set[str],
+        recognised_tokens: set[str],
+        candidates: List[tuple[MenuItem, set[str]]],
+    ) -> Optional[MenuItem]:
+        """
+        Tie-breaking heuristics for menu-item matching.
+
+        Order of preference:
+        1) If user mentions a specific variant (oat / almond / soya / coconut),
+           prefer items whose name includes that token.
+        2) If user mentions milk/dairy/lactose and there is a mix of dairy vs
+           non-dairy variants, prefer the dairy build (contains_milk=True).
+        3) Prefer the item whose tokens introduce the fewest extra non-brand
+           tokens beyond what the user said.
+        4) Fall back to the first candidate (stable).
+        """
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0][0]
+
+        # 1) Variant keywords (plant milks) – oat / almond / soya / coconut
+        VARIANT_TOKENS = {"almond", "oat", "soya", "soy", "coconut"}
+        mentioned_variants = VARIANT_TOKENS & user_tokens_all
+
+        if mentioned_variants:
+            filtered: List[tuple[MenuItem, set[str]]] = []
+            for item, toks in candidates:
+                if toks & mentioned_variants:
+                    filtered.append((item, toks))
+            if filtered:
+                candidates = filtered
+
+        if len(candidates) == 1:
+            return candidates[0][0]
+
+        # 2) Milk words – only apply *after* variant matching
+        MILK_WORDS = {"milk", "dairy", "lactose"}
+        if user_tokens_all & MILK_WORDS:
+            dairy_candidates: List[tuple[MenuItem, set[str]]] = []
+            for item, toks in candidates:
+                allergens = getattr(item, "allergens", {}) or {}
+                if allergens.get("contains_milk", False):
+                    dairy_candidates.append((item, toks))
+            if dairy_candidates:
+                candidates = dairy_candidates
+
+        if len(candidates) == 1:
+            return candidates[0][0]
+
+        # 3) Prefer items with minimal "extra" tokens (ignoring brands)
+        BRAND_TOKENS = {"starbucks", "costa", "express"}
+
+        def extra_token_count(item_tokens: set[str]) -> int:
+            no_brand = {t for t in item_tokens if t not in BRAND_TOKENS}
+            extra = no_brand - recognised_tokens
+            return len(extra)
+
+        min_extra = min(extra_token_count(toks) for _, toks in candidates)
+        best = [
+            (item, toks)
+            for item, toks in candidates
+            if extra_token_count(toks) == min_extra
+        ]
+
+        # 4) Stable fallback: just pick the first among the "best"
+        return best[0][0]
+
 
     def _format_item_allergen_answer(self, item: MenuItem) -> str:
         """
