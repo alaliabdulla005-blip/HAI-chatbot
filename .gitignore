@@ -12,3 +12,5 @@ venv/
 # OS noise
 .DS_Store
 
+# Model
+models/
