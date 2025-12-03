@@ -159,6 +159,10 @@ calories please,ask_calories
 is the cake high in sugar?,ask_calories
 how many calories in oat milk?,ask_calories
 check calories,ask_calories
+latte + muffin,ask_calories
+latte x 2 + blueberry muffin,ask_calories
+misto + cookie,ask_calories
+latte grande + vanilla x 2,ask_calories
 add a tall Misto with oat milk to my order,add_to_cart
 i want to buy a coffee,add_to_cart
 get me a grande latte,add_to_cart
@@ -199,6 +203,14 @@ dont want it anymore,remove_from_cart
 delete the latte pls,remove_from_cart
 remove the syrup,remove_from_cart
 undo add,remove_from_cart
+empty cart,remove_from_cart
+clear basket,remove_from_cart
+delete my order,remove_from_cart
+delete all items,remove_from_cart
+remove all items from my cart,remove_from_cart
+clear my cart,remove_from_cart
+remove everything from the basket,remove_from_cart
+empty my basket,remove_from_cart
 what’s in my cart right now?,show_cart
 show me my order,show_cart
 view basket,show_cart

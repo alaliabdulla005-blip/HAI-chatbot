@@ -18,7 +18,7 @@ from __future__ import annotations
 import argparse
 from typing import Optional
 
-from Chatbot.data_loader import load_menu_items
+from Chatbot.data_loader import load_menu_items, load_option_items
 from Chatbot.faq_search import FAQSearchEngine
 from Chatbot.intents import get_intent_model
 from Chatbot.dialogue_manager import DialogueManager
@@ -33,11 +33,13 @@ def build_dialogue_manager(retrain_intents: bool = False) -> DialogueManager:
     intent_model = get_intent_model(retrain=retrain_intents)  # first time: use --retrain-intents
     faq_engine = FAQSearchEngine.from_csv()
     menu_items = load_menu_items()
+    menu_options = load_option_items()
 
     dm = DialogueManager(
         intent_classifier=intent_model,
         faq_engine=faq_engine,
         menu_items=menu_items,
+        menu_options=load_option_items()
     )
     return dm
 

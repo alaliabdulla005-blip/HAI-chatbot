@@ -140,6 +140,14 @@ class MenuItem:
     diet_tags: List[str] = field(default_factory=list)
     notes: str = ""
 
+    @dataclass
+    class OptionItem:
+        option_id: str  # e.g. "opt_vanilla_pump"
+        name: str  # e.g. "Vanilla syrup (1 pump)"
+        category: str  # e.g. "syrup", "extra_shot", "plant_milk"
+        calories_kcal: float = 0.0
+        brand: str | None = None  # for brand-specific options
+
 @dataclass
 class MenuOption:
     """

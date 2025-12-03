@@ -19,10 +19,11 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 import random
 import re
+from collections import Counter
 
 from .intents import SklearnIntentClassifier, IntentLabel
 from .faq_search import FAQSearchEngine, FAQMatch
-from .domain_models import MenuItem, FAQEntry  # adjust imports if needed
+from .domain_models import MenuItem, FAQEntry, MenuOption  # adjust imports if needed
 # from .logging_utils import log_turn  # TODO: integrate later
 # from . import guardrails             # TODO: integrate mood / safety guardrails later
 
@@ -35,12 +36,14 @@ class CartLine:
     """
     Minimal cart line.
 
-    You can later swap this to use a CartItem from domain_models if you
-    already defined one there – just update types accordingly.
+    `selected_options` stores option_ids from options.csv (e.g. syrups, plant milks,
+    extra shots). Duplicates in the list mean multiple units of the same option
+    (e.g. "vanilla syrup x 2").
     """
     item_id: str
     item_name: str
     quantity: int = 1
+    selected_options: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -132,6 +135,12 @@ class DialogueManager:
 
         # cart / container words (not part of item name)
         "cart", "basket", "order", "bag",
+
+        # command / quantity words that shouldn't drive menu matching
+        "add", "remove", "delete", "take", "put", "get", "buy", "drop",
+        "cancel", "undo", "clear", "empty",
+        "want", "like", "have",
+        "one", "two", "three", "1", "2", "3",
     }
 
     def __init__(
@@ -139,12 +148,15 @@ class DialogueManager:
         intent_classifier: SklearnIntentClassifier,
         faq_engine: FAQSearchEngine,
         menu_items: Sequence[MenuItem],
+        menu_options: Optional[Sequence[MenuOption]] = None,
         config: Optional[ChatbotConfig] = None,
     ) -> None:
         self.intent_classifier = intent_classifier
         self.faq_engine = faq_engine
         self.menu_items = list(menu_items)
         self._menu_vocab = self._build_menu_vocab(self.menu_items)
+        self.menu_options = list(menu_options) if menu_options is not None else []
+        self.options_by_id = {opt.option_id: opt for opt in self.menu_options}
         self.config = config or ChatbotConfig()
         self.state = ConversationState()
 
@@ -175,7 +187,7 @@ class DialogueManager:
         lowered = raw.lower()
 
         # Direct question about the stored name
-        if "what is my name" in lowered:
+        if "what is my name" in lowered or "what's my name" in lowered or "whats my name" in lowered:
             return f"Right now, I know you as {self.state.user_name}."
 
         # Heuristic: user wants to change THEIR own name
@@ -231,6 +243,49 @@ class DialogueManager:
         # 2) Intent detection
         intent_label, confidence = self.intent_classifier.predict_intent(raw)
         self.state.last_intent = intent_label
+
+        # NEW: override misclassified calorie math expressions
+        # e.g. "Latte grande + vanilla × 2" should be ASK_CALORIES, not ADD_TO_CART
+        if self._looks_like_calorie_expression(raw):
+            intent_label = IntentLabel.ASK_CALORIES
+            confidence = 1.0
+
+            # Extra guard: only trust emotional intents if there are clear
+            # emotional / complaint keywords in the text. This reduces cases
+            # where neutral questions are misclassified as "angry" or "complaint".
+            if intent_label in {
+                IntentLabel.USER_ANGRY,
+                IntentLabel.USER_INSULT,
+                IntentLabel.USER_COMPLAINT,
+            }:
+                has_anger_kw = any(kw in lowered for kw in self.ANGRY_KEYWORDS)
+                has_insult_kw = any(kw in lowered for kw in self.INSULT_KEYWORDS)
+                has_complaint_kw = any(
+                    phrase in lowered
+                    for phrase in [
+                        "complaint",
+                        "make a complaint",
+                        "file a complaint",
+                        "not working",
+                        "isn't working",
+                        "isnt working",
+                        "doesn't work",
+                        "doesnt work",
+                        "working properly",
+                    ]
+                )
+
+                if intent_label in {IntentLabel.USER_ANGRY, IntentLabel.USER_INSULT}:
+                    # If the classifier says "angry/insult" but there is *no*
+                    # anger/insult keyword, treat this as a misclassification.
+                    if not (has_anger_kw or has_insult_kw):
+                        intent_label = None
+
+                elif intent_label is IntentLabel.USER_COMPLAINT:
+                    # Complaint must have either explicit complaint wording or
+                    # at least some anger/insult context.
+                    if not (has_complaint_kw or has_anger_kw or has_insult_kw):
+                        intent_label = None
 
         if intent_label is None or confidence < self.config.intent_confidence_threshold:
             # Try insult / angry keywords before a generic fallback
@@ -312,14 +367,20 @@ class DialogueManager:
         return "What name would you like to give me?"
 
     def _handle_user_name_reply(self, user_text: str) -> str:
+        # Don't treat questions like "what's my name?" as the name itself
+        lowered = user_text.lower()
+        if "name" in lowered and ("what" in lowered or "?" in lowered):
+            return "I didn’t quite catch a name there – try something like “Ali” or “Sara”."
+
         # Reuse the same extraction logic (handles "my name is Ali", "I'm Ali", or just "Ali")
         name = self._extract_user_name(user_text) or self._clean_name(user_text)
         if not name:
             return "I didn’t quite catch that – could you give me a short name?"
 
-        self.state.user_name = name
+        # Optional polish: normalise stored names to title case
+        self.state.user_name = name.strip().title()
         self.state.awaiting_user_name = False
-        return f"Nice to meet you, {name}!"
+        return f"Nice to meet you, {self.state.user_name}!"
 
     def _handle_bot_name_reply(self, user_text: str) -> str:
         name = self._extract_bot_name(user_text) or self._clean_name(user_text)
@@ -493,17 +554,18 @@ class DialogueManager:
         names = ", ".join(sorted({m.name for m in vegan_drinks}))
         return f"Vegan-friendly drinks on our current menu include: {names}."
 
-    def _handle_halal_options(self, _: str) -> str:
+    def _handle_halal_options(self, user_text: str) -> str:
+        item = self._find_menu_item_in_text(user_text)
+        if item is not None:
+            # Reuse allergen info + a small halal explanation.
+            return self._format_item_allergen_answer(item) + "\n\n" + \
+                "Based on ingredients, this item has no pork or alcohol in our data, " \
+                "but please always check live guides and packaging if halal status is critical."
+
+        # Fallback: general halal guidance (FAQ)
         faq = self.faq_engine.get_faq_by_id("non_halal_items")
         if faq:
-            # That FAQ explains non-halal items and filtering
             return faq.answer_markdown
-
-        return (
-            "Some food items contain pork or bacon and are not halal-friendly. "
-            "Drinks built without alcoholic ingredients are usually halal-friendly. "
-            "Please check item details or ask staff if unsure."
-        )
 
     def _handle_gluten_free(self, user_text: str) -> str:
         """
@@ -541,15 +603,37 @@ class DialogueManager:
             "but there can still be cross-contact from shared equipment."
         )
 
-    def _handle_calories(self, _: str) -> str:
-        faq = self.faq_engine.get_faq_by_id("calorie_math")
-        if faq:
-            return faq.answer_markdown
+    def _handle_calories(self, user_text: str) -> str:
+        """
+        Answer calorie questions.
 
-        return (
-            "I can add up calories based on each item’s base value plus extras "
-            "(like syrups and extra espresso shots). Tell me your drink and customisations."
-        )
+        - If the text looks like a 'math-style' expression (e.g. "latte + muffin",
+          "latte x 2 + muffin"), we try to parse it as multiple items and sum
+          their calories.
+        - Otherwise, we treat it as a normal question about a single item and
+          look up that item's calories.
+        """
+        text = (user_text or "").strip()
+        if not text:
+            # Nothing to go on – generic explanation
+            faq = self.faq_engine.get_faq_by_id("calorie_math")
+            if faq:
+                return (
+                        "Tell me the drink or food you’re asking about, "
+                        "and I can calculate an approximate calorie total.\n\n"
+                        + faq.answer_markdown
+                )
+            return (
+                "Tell me the drink or food you’re asking about, "
+                "and I’ll calculate an approximate calorie total based on our menu data."
+            )
+
+        # Expression like "latte + muffin" or "latte x 2 + cookie"
+        if self._looks_like_calorie_expression(text):
+            return self._answer_calorie_expression(text)
+
+        # Simple question like "how many calories in a latte?"
+        return self._answer_calorie_simple(text)
 
     # ------------------------------------------------------------------
     # Handlers: cart / transaction state
@@ -557,69 +641,219 @@ class DialogueManager:
 
     def _handle_add_to_cart(self, user_text: str) -> str:
         """
-        Very simple first pass:
-        - Try to match a menu item by name.
-        - If we find one, add quantity 1.
-        Later you can extend this to parse size, milk choice, etc.
+        Simple add-to-cart handler:
+
+        - Use the more relaxed item matcher so we can handle phrases like
+          "add latte + vanilla syrup x 2 + extra shot to cart".
+        - Parse options (size, milk, syrups, shots, toppings, sweeteners)
+          from the same utterance and attach them to the cart line.
         """
-        item = self._find_menu_item_in_text(user_text)
+        # Use relaxed matching so "latte + vanilla syrup x 2" still finds "Latte"
+        item = self._find_menu_item_in_text_relaxed(user_text)
         if item is None:
             return (
                 "I’m not sure which item to add. "
                 "Try saying something like “add a tall Misto with oat drink to my order”."
             )
 
-        # Add or increment in cart
+        # Detect options for this item (sizes, milks, syrups, shots, etc.)
+        option_pairs = self._parse_options_from_text(user_text, base_item=item)
+        selected_option_ids: List[str] = []
+        for opt, qty in option_pairs:
+            for _ in range(max(qty, 1)):
+                selected_option_ids.append(opt.option_id)
+
+        # Merge lines only if item_id AND options match
+        def same_config(line: CartLine) -> bool:
+            return (
+                    line.item_id == item.item_id
+                    and sorted(line.selected_options) == sorted(selected_option_ids)
+            )
+
         for line in self.state.cart:
-            if line.item_id == item.item_id:
+            if same_config(line):
                 line.quantity += 1
                 break
         else:
-            self.state.cart.append(CartLine(item_id=item.item_id, item_name=item.name, quantity=1))
+            self.state.cart.append(
+                CartLine(
+                    item_id=item.item_id,
+                    item_name=item.name,
+                    quantity=1,
+                    selected_options=selected_option_ids,
+                )
+            )
+
+        if selected_option_ids:
+            options_label = self._format_options_summary(selected_option_ids)
+            return f"Added {item.name} ({options_label}) to your cart."
 
         return f"Added {item.name} to your cart."
 
+    def _is_clear_cart_command(self, lowered: str) -> bool:
+        """
+        Detect phrases that clearly mean 'empty the whole cart',
+        regardless of which specific items are inside.
+        """
+        # Normalised phrases
+        clear_phrases = [
+            "empty cart",
+            "empty my cart",
+            "empty the cart",
+            "clear cart",
+            "clear my cart",
+            "clear the cart",
+            "clear basket",
+            "clear my basket",
+            "clear the basket",
+            "clear order",
+            "clear my order",
+            "delete my order",
+            "delete all items",
+            "remove all items",
+            "remove everything",
+            "delete everything",
+            "clear all",
+        ]
+        if any(p in lowered for p in clear_phrases):
+            return True
+
+        # Generic pattern: "empty"/"clear" + "cart"/"basket"/"order"
+        if (("empty" in lowered or "clear" in lowered)
+                and ("cart" in lowered or "basket" in lowered or "order" in lowered)):
+            return True
+
+        return False
+
     def _handle_remove_from_cart(self, user_text: str) -> str:
+        lowered = (user_text or "").lower()
+
         if not self.state.cart:
             return "Your cart is currently empty."
 
+        # 1) Bulk clear-cart commands: "delete all items", "clear cart", "remove everything", etc.
+        if self._is_clear_cart_command(lowered):
+            self.state.cart.clear()
+            return "Your cart is now empty."
+
+        # 2) Try to match a specific menu item name in the text.
         item = self._find_menu_item_in_text(user_text)
+
         if item is None:
-            # Try a very simple heuristic: if only one thing is in the cart, remove it
+            # 2a) Fallback: if there is only *one distinct line* in the cart,
+            #     interpret this as "remove one of whatever is in there",
+            #     unless the user clearly asked to remove *all*.
             if len(self.state.cart) == 1:
+                line = self.state.cart[0]
+
+                # If they explicitly mentioned "all" / "everything", drop the whole line.
+                if re.search(r"\b(all|everything)\b", lowered):
+                    removed = self.state.cart.pop()
+                    return f"Removed {removed.item_name} from your cart."
+
+                # If quantity > 1: decrement instead of wiping it out.
+                if line.quantity > 1:
+                    # If they say "one" / "1", be explicit
+                    if re.search(r"\b(one|1)\b", lowered):
+                        line.quantity -= 1
+                        return f"Removed one {line.item_name} from your cart."
+                    # Default behaviour: still just remove one
+                    line.quantity -= 1
+                    return f"Removed one {line.item_name} from your cart."
+
+                # quantity == 1 → safe to remove completely
                 removed = self.state.cart.pop()
                 return f"Removed {removed.item_name} from your cart."
+
+            # 2b) More than one distinct line in the cart and we couldn't match an item
             return (
                 "I couldn’t work out which item to remove. "
                 "Please mention the drink or food name that’s in your cart."
             )
 
+        # 3) We matched a specific menu item → remove from that line only
+        target_base = self._base_item_name(item.name)
+
+        def same_base(line: CartLine) -> bool:
+            return self._base_item_name(line.item_name) == target_base
+
         new_cart: List[CartLine] = []
         removed_any = False
+        removed_name: Optional[str] = None
+
+        # First pass: try exact item_id match
         for line in self.state.cart:
             if line.item_id == item.item_id:
                 removed_any = True
-                # remove one instance; if more than one, decrement quantity
+                removed_name = line.item_name
                 if line.quantity > 1:
                     line.quantity -= 1
                     new_cart.append(line)
-                # else, drop it completely
+                # quantity == 1 → drop the line
             else:
                 new_cart.append(line)
+
+        # If no exact match, but exactly one cart line shares the same base name
+        if not removed_any:
+            # restore original cart to try base-name removal
+            new_cart = []
+            base_matches = [line for line in self.state.cart if same_base(line)]
+
+            if len(base_matches) == 1:
+                match_id = base_matches[0].item_id
+                for line in self.state.cart:
+                    if line.item_id == match_id:
+                        removed_any = True
+                        removed_name = line.item_name
+                        if line.quantity > 1:
+                            line.quantity -= 1
+                            new_cart.append(line)
+                        # quantity == 1 → drop this line
+                    else:
+                        new_cart.append(line)
 
         self.state.cart = new_cart
 
         if not removed_any:
-            return f"I couldn’t find {item.name} in your cart."
-        return f"Removed one {item.name} from your cart."
+            return (
+                "I couldn’t work out which item to remove. "
+                "Please mention the drink or food name that’s in your cart."
+            )
+
+        return f"Removed one {removed_name} from your cart."
 
     def _handle_show_cart(self, _: str) -> str:
         if not self.state.cart:
             return "Your cart is empty at the moment."
-        lines = []
+
+        lines: List[str] = []
+        total_kcal: float = 0.0
+
         for line in self.state.cart:
-            lines.append(f"- {line.item_name} × {line.quantity}")
+            line_kcal = self._estimate_line_calories(line)
+            total_kcal += line_kcal
+
+            options_summary = self._format_options_summary(
+                getattr(line, "selected_options", []) or []
+            )
+            if options_summary:
+                base_desc = f"{line.item_name} × {line.quantity} ({options_summary})"
+            else:
+                base_desc = f"{line.item_name} × {line.quantity}"
+
+            if line_kcal > 0:
+                lines.append(f"- {base_desc}: ~{line_kcal:.0f} kcal")
+            else:
+                lines.append(f"- {base_desc}")
+
         cart_text = "\n".join(lines)
+
+        if total_kcal > 0:
+            return (
+                f"Here’s what’s in your cart:\n{cart_text}\n\n"
+                f"Estimated total: **~{total_kcal:.0f} kcal** for your whole cart."
+            )
+
         return f"Here’s what’s in your cart:\n{cart_text}"
 
     def _handle_checkout(self, _: str) -> str:
@@ -693,7 +927,8 @@ class DialogueManager:
         """
         TOKEN_NORMALISATIONS = {
             "choc": "chocolate",  # so "hot choc" matches "Hot Chocolate"
-            "soy": "soya",  # treat "soy" the same as "soya"
+            "soy": "soya",
+            "mist": "misto",# treat "soy" the same as "soya"
         }
 
         tokens: List[str] = []
@@ -715,6 +950,529 @@ class DialogueManager:
                 vocab.add(tok)
         return vocab
 
+    def _parse_options_from_text(
+            self,
+            user_text: str,
+            base_item: Optional[MenuItem] = None,
+    ) -> List[tuple[MenuOption, int]]:
+        """
+        Lightweight option parser.
+
+        - Looks for size, milk, syrups, toppings, sweeteners and extra shots
+          mentioned in the utterance.
+        - Returns a list of (MenuOption, quantity) pairs.
+
+        Behaviour:
+        - Syrups:
+            * If user says "sugar free ..." or "free sugar ..." we try to use
+              sugar_free_* syrups.
+            * If there is no sugar_free variant for that drink/flavour, we
+              gracefully fall back to the normal syrup.
+        - We also collapse duplicates so you get at most ONE option per
+          (option_group, flavour core), e.g. only one "vanilla syrup" even
+          though options.csv has Starbucks + Costa variants.
+
+        Important detail:
+        - We parse options per '+' segment so "vanilla syrup x 2 + extra shot"
+          gives vanilla syrup × 2 and extra shot × 1 (not 2).
+        """
+        # If you haven't wired this yet, DialogueManager.__init__ should include:
+        #   self.menu_options = load_option_items()
+        if not getattr(self, "menu_options", None):
+            return []
+
+        text = (user_text or "").lower()
+        if not text.strip():
+            return []
+
+        # Detect "sugar free" and "free sugar" variants
+        sugar_free_requested = bool(
+            re.search(r"\b(sugar[- ]?free|free[- ]?sugar)\b", text)
+        )
+
+        # Split text on '+' so quantity like "x 2" only applies inside its segment
+        segments = [seg.strip() for seg in re.split(r"\s*\+\s*", text) if seg.strip()]
+
+        NUMBER_WORDS: dict[str, int] = {
+            "one": 1, "1": 1,
+            "two": 2, "2": 2,
+            "three": 3, "3": 3,
+            "double": 2,
+            "triple": 3,
+        }
+
+        def applies_to_item(opt: MenuOption) -> bool:
+            """
+            Check options.csv `applies_to_scope` (item_id:... | category:...).
+            If scope is blank, treat as global.
+            """
+            if base_item is None:
+                return True
+
+            scope = (opt.applies_to_scope or "").strip()
+            if not scope:
+                return True
+
+            item_id = getattr(base_item, "item_id", "")
+            category = (getattr(base_item, "category", "") or "").lower()
+
+            for clause in scope.split("|"):
+                clause = clause.strip()
+                if not clause:
+                    continue
+                if clause.startswith("item_id:"):
+                    if item_id == clause[len("item_id:"):]:
+                        return True
+                elif clause.startswith("category:"):
+                    if category == clause[len("category:"):].lower():
+                        return True
+
+            return False
+
+        # For each (group, core) we keep at most:
+        #   - one "normal" option (non-sugar-free)
+        #   - one "sugar_free" option
+        # and aggregate quantities per type.
+        bucket: dict[
+            tuple[str, str],
+            dict[str, tuple[MenuOption, int]],
+        ] = {}
+
+        for seg in segments:
+            seg_tokens = self._tokenise_for_matching(seg)
+            if not seg_tokens:
+                continue
+
+            # Segment-level quantity (e.g. "vanilla syrup x 2")
+            seg_qty = 1
+
+            # Pattern 1: "... x 2"
+            m = re.search(r"(?:x|×|\*)\s*(\d+)", seg)
+            if not m:
+                # Pattern 2: "2x" or "2 x"
+                m = re.search(r"\b(\d+)\s*(?:x|×|\*)", seg)
+            if m:
+                try:
+                    seg_qty = max(int(m.group(1)), 1)
+                except ValueError:
+                    seg_qty = 1
+            else:
+                # Words like "double shot", "triple vanilla"
+                for word, n in (("triple", 3), ("double", 2), ("three", 3), ("two", 2)):
+                    if re.search(rf"\b{word}\b", seg):
+                        seg_qty = n
+                        break
+
+            for opt in self.menu_options:
+                if not applies_to_item(opt):
+                    continue
+
+                group = (opt.option_group or "").lower()
+                value = (opt.option_value or "").lower()
+
+                # Normalise the option value to tokens
+                base_value = value.replace("_flavour", "").replace("_", " ")
+                val_tokens = [
+                    t for t in re.findall(r"[a-z0-9]+", base_value) if t
+                ]
+                if not val_tokens:
+                    continue
+
+                # We use the last token as the "core" flavour (vanilla, caramel, oat, shot, …)
+                core = val_tokens[-1]
+
+                aliases = set(val_tokens)
+                # Extra synonyms
+                if core == "soya":
+                    aliases.add("soy")
+                if group == "size":
+                    aliases.add(base_value)  # e.g. "venti hot" as a phrase
+
+                # Check if this option is even mentioned in this segment
+                if not any(a in seg_tokens for a in aliases):
+                    continue
+
+                # Decide whether this is treated as "sugar_free" or "normal"
+                is_sugar_free_opt = ("sugar_free" in value) or ("sugar-free" in value)
+                sf_key = "sugar_free" if (group == "syrup" and is_sugar_free_opt) else "normal"
+
+                # Which groups should actually respect the segment quantity?
+                if group in {"syrup", "extra_shot", "topping", "sweetener"}:
+                    qty = seg_qty
+                else:
+                    # size / milk / some "other" adjustments are not multiplicative
+                    qty = 1
+
+                qty = max(qty, 1)
+
+                key = (group, core)
+                per_type = bucket.setdefault(key, {})
+
+                existing = per_type.get(sf_key)
+                if existing is None:
+                    per_type[sf_key] = (opt, qty)
+                else:
+                    prev_opt, prev_qty = existing
+                    per_type[sf_key] = (prev_opt, prev_qty + qty)
+
+        # Turn the bucket into a flat list, applying sugar_free preference / fallback
+        results: List[tuple[MenuOption, int]] = []
+
+        for (group, core), per_type in bucket.items():
+            normal = per_type.get("normal")
+            sugar_free = per_type.get("sugar_free")
+
+            if group == "syrup":
+                if sugar_free_requested:
+                    # Prefer sugar-free; if not available for this drink, fall back to normal
+                    if sugar_free is not None:
+                        results.append(sugar_free)
+                    elif normal is not None:
+                        results.append(normal)
+                else:
+                    # Prefer normal; if not available (rare), fall back to sugar-free
+                    if normal is not None:
+                        results.append(normal)
+                    elif sugar_free is not None:
+                        results.append(sugar_free)
+                        milk_indices = [
+                            i for i, (opt, _qty) in enumerate(results)
+                            if (opt.option_group or "").lower() == "milk"
+                        ]
+                        if len(milk_indices) > 1:
+                            last_idx = milk_indices[-1]
+                            chosen_opt, chosen_qty = results[last_idx]
+                            # Drop all milks, then re-add the chosen one
+                            results = [
+                                pair for pair in results
+                                if (pair[0].option_group or "").lower() != "milk"
+                            ]
+                            results.append((chosen_opt, chosen_qty))
+
+        return results
+
+    def _format_option_label(self, opt: MenuOption, qty: int = 1) -> str:
+        """
+        Turn a MenuOption into a short label, optionally with a multiplier.
+
+        Special cases:
+        - Syrups: nicely label sugar-free variants as
+          "sugar-free vanilla syrup", "sugar-free caramel syrup", etc.
+        - Milks: ensure the word 'milk' appears.
+        - Extra shots: force "extra espresso shot".
+        """
+        value = (opt.option_value or "").strip() or opt.option_id
+        group = (opt.option_group or "").lower()
+
+        # Tokenise the raw value to reason about flavour / sugar-free status
+        tokens_raw = re.findall(r"[a-z0-9]+", value.lower())
+        # Drop generic "flavour" token
+        tokens_no_flavour = [t for t in tokens_raw if t != "flavour"]
+
+        # Detect sugar-free variants from either the raw value or tokens
+        is_sugar_free = (
+                "sugar_free" in value.lower()
+                or "sugar-free" in value.lower()
+                or ("sugar" in tokens_no_flavour and "free" in tokens_no_flavour)
+        )
+
+        if group == "syrup":
+            # e.g. sugar_free_vanilla_flavour, caramel_syrup, etc.
+            core_tokens = [
+                t for t in tokens_no_flavour
+                if t not in {"sugar", "free", "syrup"}
+            ]
+            flavour = core_tokens[-1] if core_tokens else "syrup"
+
+            if is_sugar_free:
+                base = f"sugar-free {flavour} syrup"
+            else:
+                base = f"{flavour} syrup"
+        else:
+            # Generic base label for non-syrup options
+            if tokens_no_flavour:
+                base = " ".join(tokens_no_flavour)
+            else:
+                base = value.replace("_", " ")
+
+            if group == "milk":
+                # Ensure we end up with "oat milk", "soya milk", etc.
+                if "milk" not in base:
+                    base = f"{base} milk"
+            elif group == "extra_shot":
+                base = "extra espresso shot"
+            elif group == "size":
+                # Keep specific nicer label for venti_hot if used
+                if value == "venti_hot":
+                    base = "venti (hot)"
+
+        if qty > 1:
+            return f"{base} × {qty}"
+        return base
+
+    def _format_options_summary(self, option_ids: List[str]) -> str:
+        """
+        Summarise a list of option_ids as a readable string, e.g.
+        'oat milk, vanilla syrup × 2'.
+        """
+        if not option_ids:
+            return ""
+
+        counts = Counter(option_ids)
+        parts: List[str] = []
+        for opt_id, qty in counts.items():
+            opt = self.options_by_id.get(opt_id)
+            if not opt:
+                continue
+            label = self._format_option_label(opt, qty)
+            if label:
+                parts.append(label)
+
+        return ", ".join(parts)
+
+    def _estimate_line_calories(self, line: CartLine) -> float:
+        """
+        Estimate total calories for a cart line (quantity × per-drink calories).
+
+        - MenuItem.calories_kcal is treated as the base drink/food calories.
+        - Each option in line.selected_options adds MenuOption.calories_delta_kcal.
+
+        This is a simple additive model. If you later want 'replacement milks'
+        (subtract default dairy, add plant milk), adjust the logic here.
+        """
+        # Find the base menu item
+        base_item: Optional[MenuItem] = None
+        for item in self.menu_items:
+            if item.item_id == line.item_id:
+                base_item = item
+                break
+
+        base_kcal = (getattr(base_item, "calories_kcal", 0.0) or 0.0)
+        per_unit = base_kcal
+
+        # Add all selected options (duplicates mean multiples, e.g. vanilla × 2)
+        for opt_id in getattr(line, "selected_options", []) or []:
+            opt = self.options_by_id.get(opt_id)
+            if not opt:
+                continue
+            delta = getattr(opt, "calories_delta_kcal", 0.0) or 0.0
+            per_unit += delta
+
+        return per_unit * max(line.quantity, 1)
+
+    def _looks_like_calorie_expression(self, user_text: str) -> bool:
+        """
+        Heuristic: does this text look like a 'calorie math' expression?
+
+        We treat something as a calorie expression if:
+        - it contains arithmetic operators like +, -, x, ×, * or /
+        - it mentions at least one menu-like token
+        - it does NOT look like a straightforward order command
+          (no "add", "order", "buy", etc.)
+        """
+        lowered = (user_text or "").lower()
+
+        # Must contain at least one arithmetic symbol
+        if not re.search(r"[+\-*/×x]", lowered):
+            return False
+
+        # Avoid normal ordering phrases – those should stay ADD_TO_CART
+        ORDER_WORDS = {
+            "add", "order", "buy", "get", "put", "bring", "take",
+            "have", "want", "like", "give", "takeaway",
+        }
+        if any(re.search(rf"\b{w}\b", lowered) for w in ORDER_WORDS):
+            return False
+
+        # At least one token must look like it comes from the menu vocabulary
+        tokens = set(self._tokenise_for_matching(lowered))
+        if not tokens:
+            return False
+
+        return any(t in self._menu_vocab for t in tokens)
+
+    def _answer_calorie_simple(self, user_text: str) -> str:
+        """
+        Handle normal questions like:
+        - "how many calories in a latte?"
+        - "cals in tall misto"
+        """
+        item = self._find_menu_item_in_text_relaxed(user_text)
+        if item is None:
+            # We couldn't confidently match any specific menu item
+            faq = self.faq_engine.get_faq_by_id("calorie_math")
+            if faq:
+                return (
+                    "Tell me the drink or food you’re asking about "
+                    "(for example, “Latte” or “Blueberry Muffin”), "
+                    "and I’ll look up its calories.\n\n"
+                    + faq.answer_markdown
+                )
+            return (
+                "Tell me the drink or food you’re asking about "
+                "(for example, “Latte” or “Blueberry Muffin”), "
+                "and I’ll look up its calories."
+            )
+
+        kcal = getattr(item, "calories_kcal", 0.0) or 0.0
+        if kcal <= 0.0:
+            faq = self.faq_engine.get_faq_by_id("calorie_math")
+            extra = "\n\n" + faq.answer_markdown if faq else ""
+            return (
+                f"I couldn’t find calorie data for **{item.name}** in my menu yet."
+                + extra
+            )
+
+        return (
+            f"Based on our menu data, **{item.name}** has about **{kcal:.0f} kcal** per serving "
+            "before any extra syrups, toppings or size changes."
+        )
+
+    def _answer_calorie_expression(self, user_text: str) -> str:
+        """
+        Handle expressions like:
+        - "latte + muffin"
+        - "latte x 2 + blueberry muffin"
+        - "latte + vanilla syrup x 2 + extra shot"
+
+        We sum:
+        - base calories from menu items, and
+        - delta calories from options (syrups, extra shots, milks, etc.)
+          using options.csv.
+        """
+        text = (user_text or "").strip()
+        if not text:
+            return self._answer_calorie_simple(user_text)
+
+        # Split by '+' as the top-level separator
+        parts = re.split(r"\s*\+\s*", text)
+
+        item_contribs: List[tuple[MenuItem, int]] = []
+        option_contribs: List[tuple[MenuOption, int]] = []
+        unknown_segments: List[str] = []
+
+        for raw_part in parts:
+            part = raw_part.strip()
+            if not part:
+                continue
+
+            # Look for quantity patterns: "x 2", "×2", "*2", "times 2"
+            qty = 1
+            segment_for_match = part
+
+            m = re.search(r"(?:x|×|\*|\btimes\b)\s*(\d+)", part, flags=re.IGNORECASE)
+            if m:
+                try:
+                    qty = int(m.group(1))
+                except ValueError:
+                    qty = 1
+                segment_for_match = re.sub(
+                    r"(?:x|×|\*|\btimes\b)\s*\d+",
+                    "",
+                    part,
+                    flags=re.IGNORECASE,
+                ).strip()
+            else:
+                # Also support patterns like "2x latte"
+                m2 = re.search(r"(\d+)\s*(?:x|×|\*)", part, flags=re.IGNORECASE)
+                if m2:
+                    try:
+                        qty = int(m2.group(1))
+                    except ValueError:
+                        qty = 1
+                    segment_for_match = re.sub(
+                        r"\d+\s*(?:x|×|\*)",
+                        "",
+                        part,
+                        flags=re.IGNORECASE,
+                    ).strip()
+
+            # Try to match this segment to a menu item
+            item = self._find_menu_item_in_text_relaxed(segment_for_match)
+            kcal = getattr(item, "calories_kcal", 0.0) if item else 0.0
+
+            if item is not None and kcal > 0.0:
+                item_contribs.append((item, max(qty, 1)))
+
+                # also look for options *within* this item phrase
+                opt_pairs = self._parse_options_from_text(segment_for_match, base_item=item)
+                option_contribs.extend(opt_pairs)
+            else:
+                # No menu item → maybe this is pure options like "vanilla syrup x 2"
+                opt_pairs = self._parse_options_from_text(segment_for_match, base_item=None)
+                if opt_pairs:
+                    option_contribs.extend(opt_pairs)
+                elif segment_for_match:
+                    unknown_segments.append(segment_for_match)
+
+        if not item_contribs and not option_contribs:
+            # Nothing matched – fall back to simple behaviour
+            return self._answer_calorie_simple(user_text)
+
+        total_items_kcal = sum(
+            (getattr(item, "calories_kcal", 0.0) or 0.0) * qty
+            for item, qty in item_contribs
+        )
+
+        # Aggregate options by option_id
+        option_agg: dict[str, tuple[MenuOption, int]] = {}
+        for opt, qty in option_contribs:
+            current = option_agg.get(opt.option_id)
+            if current is None:
+                option_agg[opt.option_id] = (opt, max(qty, 1))
+            else:
+                option_agg[opt.option_id] = (opt, current[1] + max(qty, 1))
+
+        total_options_kcal = sum(
+            (getattr(opt, "calories_delta_kcal", 0.0) or 0.0) * qty
+            for opt, qty in option_agg.values()
+        )
+
+        total_kcal = total_items_kcal + total_options_kcal
+
+        lines: List[str] = ["Here’s an approximate calorie breakdown:"]
+
+        # Base items
+        for item, qty in item_contribs:
+            per = getattr(item, "calories_kcal", 0.0) or 0.0
+            if qty <= 1:
+                lines.append(f"- {item.name}: about {per:.0f} kcal.")
+            else:
+                lines.append(
+                    f"- {item.name} × {qty}: about {per:.0f} kcal each = {per * qty:.0f} kcal."
+                )
+
+        # Options
+        if option_agg:
+            lines.append("")
+            lines.append("Options:")
+            for opt_id, (opt, qty) in option_agg.items():
+                delta = getattr(opt, "calories_delta_kcal", 0.0) or 0.0
+                label = self._format_option_label(opt, qty)
+                if qty <= 1:
+                    lines.append(f"- {label}: adds ~{delta:.0f} kcal.")
+                else:
+                    lines.append(
+                        f"- {label}: about {delta:.0f} kcal each = {delta * qty:.0f} kcal."
+                    )
+
+        lines.append("")
+        lines.append(
+            f"**Estimated total: ~{total_kcal:.0f} kcal** (base items + options)."
+        )
+
+        if unknown_segments:
+            unique_unknown = sorted({seg for seg in unknown_segments})
+            lines.append("")
+            lines.append(
+                "I couldn’t match these parts to specific menu items or options yet, "
+                "so they’re not included in the total: "
+                + ", ".join(f"`{seg}`" for seg in unique_unknown)
+                + "."
+            )
+
+        return "\n".join(lines)
+
     def _looks_like_item_query(self, user_text: str) -> bool:
         """
         Heuristic: does this text mention any token that exists in the menu?
@@ -725,6 +1483,18 @@ class DialogueManager:
         if not tokens:
             return False
         return any(t in self._menu_vocab for t in tokens)
+
+    @staticmethod
+    def _base_item_name(name: str) -> str:
+        """
+        Normalise an item name to a base form, e.g.
+        'Misto - oat drink' -> 'misto'
+        'Flat White - almond drink' -> 'flat white'
+        """
+        if not name:
+            return ""
+        return name.split(" - ")[0].strip().lower()
+
 
     def _find_menu_item_in_text(self, user_text: str) -> Optional[MenuItem]:
         """
@@ -793,6 +1563,58 @@ class DialogueManager:
         # At this point we have one or more "best" candidates that are
         # safe to consider. Use tie-breaking to pick the best one.
         return self._break_tie(user_tokens_all, recognised_tokens, candidates)
+
+    def _find_menu_item_in_text_relaxed(self, user_text: str) -> Optional[MenuItem]:
+        """
+        A more permissive variant of _find_menu_item_in_text used for calorie
+        questions, where we can afford to be less strict than allergen logic.
+
+        Differences from the strict version:
+        - We DO NOT block 1-token matches just because there are extra
+          unknown tokens (e.g. "grande", "vanilla", "unicorn").
+        - Still uses the same tokenisation and tie-breaking logic.
+        """
+        text = (user_text or "").lower()
+        if not text:
+            return None
+
+        user_tokens_all = set(self._tokenise_for_matching(text))
+        if not user_tokens_all:
+            return None
+
+        recognised_tokens = {t for t in user_tokens_all if t in self._menu_vocab}
+        if not recognised_tokens:
+            return None
+
+        best_overlap = 0
+        candidates: List[tuple[MenuItem, set[str]]] = []
+
+        for item in self.menu_items:
+            name = getattr(item, "name", "")
+            if not name:
+                continue
+
+            candidate_text = f"{getattr(item, 'brand', '')} {name}"
+            item_tokens = set(self._tokenise_for_matching(candidate_text))
+            if not item_tokens:
+                continue
+
+            overlap = len(recognised_tokens & item_tokens)
+            if overlap == 0:
+                continue
+
+            if overlap > best_overlap:
+                best_overlap = overlap
+                candidates = [(item, item_tokens)]
+            elif overlap == best_overlap:
+                candidates.append((item, item_tokens))
+
+        if best_overlap == 0 or not candidates:
+            return None
+
+        # Reuse the existing tie-breaking heuristics
+        return self._break_tie(user_tokens_all, recognised_tokens, candidates)
+
 
     def _break_tie(
         self,
