@@ -22,39 +22,11 @@ import re
 from collections import Counter
 
 from .intents import SklearnIntentClassifier, IntentLabel
+from .state_models import ConversationState, CartLine
 from .faq_search import FAQSearchEngine, FAQMatch
 from .domain_models import MenuItem, FAQEntry, MenuOption  # adjust imports if needed
-# from .logging_utils import log_turn  # TODO: integrate later
-# from . import guardrails             # TODO: integrate mood / safety guardrails later
-
-
-# ---------- Conversation state models ----------
-
-
-@dataclass
-class CartLine:
-    """
-    Minimal cart line.
-
-    `selected_options` stores option_ids from options.csv (e.g. syrups, plant milks,
-    extra shots). Duplicates in the list mean multiple units of the same option
-    (e.g. "vanilla syrup x 2").
-    """
-    item_id: str
-    item_name: str
-    quantity: int = 1
-    selected_options: List[str] = field(default_factory=list)
-
-
-@dataclass
-class ConversationState:
-    """All state we need to remember across turns."""
-    user_name: str = "Guest"
-    bot_name: str = "BrewBot"
-    cart: List[CartLine] = field(default_factory=list)
-    last_intent: Optional[IntentLabel] = None
-    awaiting_user_name: bool = False
-    awaiting_bot_name: bool = False
+from . import guardrails
+# from .logging_utils import log_turn  # TODO: integrate laters
 
 
 @dataclass
@@ -65,12 +37,36 @@ class ChatbotConfig:
     faq_top_k: int = 3
 
 
-# Fallback messages when we don’t understand
-FALLBACK_MESSAGES = [
-    "I’m not completely sure what you mean. Could you rephrase that?",
-    "Sorry, I didn’t quite get that. Try asking about drinks, allergens, or your order.",
-    "I might be missing something – could you say it in another way?",
+# Fallback messages when the bot don't understand
+FALLBACK_MESSAGES = FALLBACK_MESSAGES = [
+    (
+        "I’m not completely sure what you mean. "
+        "I can help with café questions like drinks, allergens, calories, vegan/halal options, "
+        "and your order."
+    ),
+    (
+        "Sorry, I didn’t quite get that. "
+        "Try asking about drinks, allergens, calories, or managing your cart and checkout."
+    ),
+    (
+        "I might be missing something – I’m best at questions about our menu, "
+        "allergens (including vegan/halal/gluten-free options), calories, and your order."
+    ),
+    (
+        "That’s a bit outside what I can do. "
+        "I’m here to help with café drinks, allergen info, calories, and your cart."
+    ),
+    (
+        "I can’t really answer that one, but I can help you with drinks, allergens, "
+        "calories, vegan/halal choices, and managing your order."
+    ),
 ]
+
+CALORIE_DISCLAIMER = (
+    "These calorie values are approximate and based on typical Tall/Small servings. "
+    "Larger sizes and customisations (different milks, syrups, toppings) will change the "
+    "numbers, so always check the latest nutrition information in-store or on the brand’s website."
+)
 
 
 # ---------- Dialogue Manager ----------
@@ -93,17 +89,6 @@ class DialogueManager:
     GREET_KEYWORDS = {
         "hi","hello","hey","good morning","good afternoon",
         "good evening","hiya","yo","morning","afternoon",
-    }
-
-    ANGRY_KEYWORDS = {
-        "annoyed", "useless", "waste of time", "frustrating",
-        "fed up", "awful", "ridiculous", "worst bot", "not happy",
-        "not satisfied", "bad experience", "rubbish",
-    }
-
-    INSULT_KEYWORDS = {
-        "stupid", "idiot", "dumb bot", "moron", "useless",
-        "hate you", "loser", "ugly bot", "shut up", "f off",
     }
 
     # NEW: tokens we ignore when fuzzy-matching menu items,
@@ -177,7 +162,12 @@ class DialogueManager:
         if not raw:
             return random.choice(FALLBACK_MESSAGES)
 
-        # 1) Pending “name” answers override normal intent detection
+        # 1) Guardrails pass
+        gr_result = guardrails.apply_guardrails(user_text=raw, state=self.state)
+        if gr_result is not None:
+            return gr_result
+
+        # 2) Pending “name” answers override normal intent detection
         if self.state.awaiting_user_name:
             return self._handle_user_name_reply(raw)
 
@@ -186,7 +176,7 @@ class DialogueManager:
 
         lowered = raw.lower()
 
-        # Direct question about the stored name
+        # 3) Direct question about the stored name
         if "what is my name" in lowered or "what's my name" in lowered or "whats my name" in lowered:
             return f"Right now, I know you as {self.state.user_name}."
 
@@ -240,7 +230,7 @@ class DialogueManager:
             if re.match(pattern, lowered):
                 return self._handle_greet(raw)
 
-        # 2) Intent detection
+        # 4) Intent detection
         intent_label, confidence = self.intent_classifier.predict_intent(raw)
         self.state.last_intent = intent_label
 
@@ -250,49 +240,20 @@ class DialogueManager:
             intent_label = IntentLabel.ASK_CALORIES
             confidence = 1.0
 
-            # Extra guard: only trust emotional intents if there are clear
-            # emotional / complaint keywords in the text. This reduces cases
-            # where neutral questions are misclassified as "angry" or "complaint".
-            if intent_label in {
-                IntentLabel.USER_ANGRY,
-                IntentLabel.USER_INSULT,
-                IntentLabel.USER_COMPLAINT,
-            }:
-                has_anger_kw = any(kw in lowered for kw in self.ANGRY_KEYWORDS)
-                has_insult_kw = any(kw in lowered for kw in self.INSULT_KEYWORDS)
-                has_complaint_kw = any(
-                    phrase in lowered
-                    for phrase in [
-                        "complaint",
-                        "make a complaint",
-                        "file a complaint",
-                        "not working",
-                        "isn't working",
-                        "isnt working",
-                        "doesn't work",
-                        "doesnt work",
-                        "working properly",
-                    ]
-                )
-
-                if intent_label in {IntentLabel.USER_ANGRY, IntentLabel.USER_INSULT}:
-                    # If the classifier says "angry/insult" but there is *no*
-                    # anger/insult keyword, treat this as a misclassification.
-                    if not (has_anger_kw or has_insult_kw):
-                        intent_label = None
-
-                elif intent_label is IntentLabel.USER_COMPLAINT:
-                    # Complaint must have either explicit complaint wording or
-                    # at least some anger/insult context.
-                    if not (has_complaint_kw or has_anger_kw or has_insult_kw):
-                        intent_label = None
+        # Let guardrails down-weight obviously misclassified emotional intents
+        intent_label = guardrails.filter_emotional_intent(intent_label, lowered)
 
         if intent_label is None or confidence < self.config.intent_confidence_threshold:
-            # Try insult / angry keywords before a generic fallback
-            if any(kw in lowered for kw in self.INSULT_KEYWORDS):
+            # Ask guardrails for emotional signals and choose a suitable reply
+            flags = guardrails.get_emotion_flags(lowered)
+
+            if flags.get("insult"):
                 return self._handle_user_insult(raw)
-            if any(kw in lowered for kw in self.ANGRY_KEYWORDS):
+            if flags.get("anger"):
                 return self._handle_user_angry(raw)
+            if flags.get("complaint"):
+                return self._handle_user_complaint(raw)
+
             # Otherwise: generic fallback
             return self._handle_fallback(raw)
 
@@ -1325,7 +1286,8 @@ class DialogueManager:
 
         return (
             f"Based on our menu data, **{item.name}** has about **{kcal:.0f} kcal** per serving "
-            "before any extra syrups, toppings or size changes."
+            "before any extra syrups, toppings or size changes.\n\n"
+            f"{CALORIE_DISCLAIMER}"
         )
 
     def _answer_calorie_expression(self, user_text: str) -> str:
@@ -1470,6 +1432,10 @@ class DialogueManager:
                 + ", ".join(f"`{seg}`" for seg in unique_unknown)
                 + "."
             )
+
+        # New: append the disclaimer for expression-based answers as well
+        lines.append("")
+        lines.append(CALORIE_DISCLAIMER)
 
         return "\n".join(lines)
 
