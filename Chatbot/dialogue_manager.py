@@ -535,17 +535,80 @@ class DialogueManager:
         return f"Vegan-friendly drinks on our current menu include: {names}."
 
     def _handle_halal_options(self, user_text: str) -> str:
+        """
+        Handle both general and item-specific halal questions.
+
+        - If we can confidently match a specific menu item, delegate to _answer_item_halal.
+        - Otherwise, give a friendly overview of halal-friendly, vegan and clearly non-halal items.
+        """
+        # 1) Item-specific question?
         item = self._find_menu_item_in_text(user_text)
         if item is not None:
-            # Reuse allergen info + a small halal explanation.
-            return self._format_item_allergen_answer(item) + "\n\n" + \
-                "Based on ingredients, this item has no pork or alcohol in our data, " \
-                "but please always check live guides and packaging if halal status is critical."
+            return self._answer_item_halal(item)
 
-        # Fallback: general halal guidance (FAQ)
-        faq = self.faq_engine.get_faq_by_id("non_halal_items")
-        if faq:
-            return faq.answer_markdown
+        # 2) General overview from the menu
+        halal_examples: List[str] = []
+        vegan_examples: List[str] = []
+        non_halal_examples: List[str] = []
+
+        for m in self.menu_items:
+            flags = self._get_halal_flags(m)
+
+            if flags["halal_friendly"]:
+                halal_examples.append(m.name)
+            elif flags["vegan_hint"]:
+                vegan_examples.append(m.name)
+            elif flags["non_halal"]:
+                non_halal_examples.append(m.name)
+
+        def _short_list(names: List[str], limit: int) -> str:
+            unique = sorted(set(names))
+            if not unique:
+                return ""
+            if len(unique) <= limit:
+                return ", ".join(unique)
+            return ", ".join(unique[:limit]) + " and others"
+
+        halal_text = _short_list(halal_examples, 3)
+        vegan_text = _short_list(vegan_examples, 4)
+        non_halal_text = _short_list(non_halal_examples, 3)
+
+        parts: List[str] = []
+
+        parts.append(
+            "From a halal point of view, here’s how our menu looks based on the "
+            "ingredient and allergen information we have (this is guidance, not a religious ruling):"
+        )
+
+        if halal_text:
+            parts.append(
+                f"- **Halal-friendly by our tags** (no pork or alcohol listed in our data): "
+                f"for example {halal_text}."
+            )
+
+        if vegan_text:
+            parts.append(
+                f"- **Vegan by ingredients** (no meat or dairy – many halal-conscious customers "
+                f"choose these): for example {vegan_text}."
+            )
+
+        if non_halal_text:
+            parts.append(
+                f"- **Clearly not suitable for a halal diet** (contains pork or similar ingredients): "
+                f"for example {non_halal_text}."
+            )
+
+        parts.append(
+            "If you tell me a specific drink or food name (like “Signature Grilled Cheese Toastie” "
+            "or “Americano black”), I can check its ingredients and halal-friendliness for you."
+        )
+
+        parts.append(
+            "For strict halal decisions, please always rely on the latest official allergen/nutrition "
+            "guides, packaging, staff advice, or a trusted scholar – I’m only summarising what’s in our CSV."
+        )
+
+        return "\n".join(parts)
 
     def _handle_gluten_free(self, user_text: str) -> str:
         """
@@ -1803,3 +1866,104 @@ class DialogueManager:
 
         lines.append("Always double-check live allergen guides and packaging if you have a severe allergy.")
         return "\n".join(lines)
+
+    def _answer_item_halal(self, item: MenuItem) -> str:
+        """
+        Item-specific halal answer built on top of the usual allergen output.
+        """
+        base_text = self._format_item_allergen_answer(item)
+        flags = self._get_halal_flags(item)
+
+        lines: List[str] = [base_text, ""]
+
+        if flags["halal_friendly"]:
+            # For things like Signature Grilled Cheese Toastie, Cheese & Marmite Mini Ciabatta, Cortado, etc.
+            lines.append(
+                "In our menu data this item is flagged as **halal-friendly** "
+                "(no pork or alcohol ingredients listed in the official allergen/food guide we used)."
+            )
+
+        elif flags["non_halal"]:
+            if flags["has_pork"]:
+                reason = (
+                    "because it includes pork-derived ingredients "
+                    "(for example bacon / ham / sausage) in our source data."
+                )
+            elif flags["has_alcohol"]:
+                reason = (
+                    "because it includes ingredients that are typically considered "
+                    "non-halal (for example alcohol) in our source data."
+                )
+            else:
+                reason = "based on the ingredient notes in our menu data."
+
+            lines.append(
+                f"In our menu data this item is listed as **not halal-friendly**, {reason}"
+            )
+
+        elif flags["vegan_hint"]:
+            # e.g. Costa Express Americano (black), vegan drinks/foods
+            lines.append(
+                "By ingredients in our menu data, this item is **vegan** (no meat or dairy). "
+                "Many halal-conscious customers treat vegan items as safe choices, "
+                "but this is not a formal halal certification."
+            )
+
+        else:
+            lines.append(
+                "We don’t have an explicit halal label for this item. "
+                "Based on our data, it does not list pork or alcohol, "
+                "but we can’t guarantee full halal compliance."
+            )
+
+        lines.append(
+            "Please treat this as approximate ingredient guidance only – it is **not** a religious fatwa. "
+            "For strict halal decisions, always check the latest official allergen/nutrition guides, "
+            "product packaging, or ask staff / a trusted scholar."
+        )
+
+        return "\n".join(lines)
+
+
+    def _get_halal_flags(self, item: MenuItem) -> dict:
+        """
+        Classify an item from our menu data into rough halal buckets.
+
+        Returns a dict with:
+        - halal_friendly: True if explicitly tagged as halal-friendly.
+        - vegan_hint: True if vegan (by tags / suitable_vegan).
+        - non_halal: True if we see pork/alcohol keywords and no halal-friendly tag.
+        - has_pork_or_alcohol: True if notes mention pork/bacon/ham/sausage or alcohol terms.
+        """
+        tags = [t.lower() for t in getattr(item, "diet_tags", [])]
+        notes_lower = (getattr(item, "notes", "") or "").lower()
+
+        # 1) Explicit halal-friendly tag wins
+        is_halal_friendly = any("halal" in t for t in tags)
+
+        # 2) Vegan by tag or boolean flag
+        is_vegan = any("vegan" in t for t in tags) or bool(
+            getattr(item, "suitable_vegan", False)
+        )
+
+        pork_keywords = ("pork", "bacon", "ham", "sausage")
+        alcohol_keywords = ("alcohol", "wine", "beer", "cider", "rum", "brandy", "liqueur")
+
+        has_pork = any(k in notes_lower for k in pork_keywords)
+        has_alcohol = any(k in notes_lower for k in alcohol_keywords)
+        has_pork_or_alcohol = has_pork or has_alcohol
+
+        # Only treat as non-halal if we see pork/alcohol AND there is no explicit halal-friendly tag
+        is_non_halal = has_pork_or_alcohol and not is_halal_friendly
+
+        return {
+            "halal_friendly": is_halal_friendly,
+            "vegan_hint": is_vegan,
+            "non_halal": is_non_halal,
+            "has_pork_or_alcohol": has_pork_or_alcohol,
+            "has_pork": has_pork,
+            "has_alcohol": has_alcohol,
+        }
+
+
+
