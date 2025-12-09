@@ -206,11 +206,7 @@ class DialogueManager:
             return self._handle_change_bot_name(raw)
 
         if "what can you do" in lowered or "what do you do" in lowered:
-            return (
-                "I can help with café questions, such as: allergens, vegan/halal/gluten-free options, "
-                "calories calculations, and managing your order – adding/removing items, "
-                "showing your cart, and checking out."
-            )
+            return self._handle_capabilities(raw)
 
         if re.search(r"\bput\b.+\b(basket|cart|order)\b", lowered):
             return self._handle_add_to_cart(raw)
@@ -301,8 +297,29 @@ class DialogueManager:
     def _handle_greet(self, _: str) -> str:
         return (
             f"Hi {self.state.user_name}! I’m {self.state.bot_name}. "
-            "You can ask about allergens, vegan options, or start an order."
+            "You can ask about allergens (including vegan/halal/gluten-free options), "
+            "calories, start an order by adding or removing items, showing your cart, "
+            "and checking out."
         )
+
+    def _handle_capabilities(self, _: str) -> str:
+        """
+        Explain what the café assistant can do and show a small teaser
+        of the menu so UI layers (CLI / Streamlit) have a clean entry point.
+        """
+        lines: List[str] = [
+            "I’m your café assistant. I can:",
+            "- Answer allergen questions, including vegan/halal/gluten-free suitability.",
+            "- Give approximate calorie estimates for drinks, food and simple combinations.",
+            "- Help with your order – adding/removing items, showing your cart and checking out.",
+        ]
+
+        teaser = self._build_menu_teaser()
+        if teaser:
+            lines.append("")
+            lines.append(teaser)
+
+        return "\n".join(lines)
 
     def _handle_change_user_name(self, user_text: str) -> str:
         """
@@ -878,6 +895,52 @@ class DialogueManager:
 
     def _handle_fallback(self, _: str) -> str:
         return random.choice(FALLBACK_MESSAGES)
+
+    def _build_menu_teaser(
+        self,
+        max_categories: int = 2,
+        max_items_per_category: int = 3,
+    ) -> str:
+        """
+        Build a short, safe 'menu teaser' used in capability replies.
+
+        Example output:
+        Here are a few examples from the menu you can ask about:
+        - Beverage: Latte, Cappuccino, Americano (black)
+        - Food: Blueberry Muffin, All Butter Belgian Dark Chocolate Chunk Cookie
+        """
+        # Filter to active items only, to avoid showing anything we’ve deactivated
+        active_items = [
+            m for m in self.menu_items
+            if getattr(m, "is_active", True)
+        ]
+        if not active_items:
+            return ""
+
+        # Group by category (e.g. Beverage, Food, etc.)
+        by_cat = {}
+        for item in active_items:
+            cat = (getattr(item, "category", None) or "Other").strip() or "Other"
+            by_cat.setdefault(cat, []).append(item)
+
+        if not by_cat:
+            return ""
+
+        lines: List[str] = ["Here are a few examples from the menu you can ask about:"]
+        category_names = sorted(by_cat.keys())
+
+        for cat in category_names[:max_categories]:
+            # Stable, predictable ordering for examples
+            examples = sorted(by_cat[cat], key=lambda m: m.name or "")[:max_items_per_category]
+            names = ", ".join(m.name for m in examples if m.name)
+            if names:
+                lines.append(f"- {cat}: {names}")
+
+        # If we didn’t manage to build any item lines, just skip the teaser
+        if len(lines) == 1:
+            return ""
+
+        return "\n".join(lines)
 
     def _tokenise_for_matching(self, s: str) -> List[str]:
         """
