@@ -12,5 +12,6 @@ venv/
 # OS noise
 .DS_Store
 
+data/successful_intents.csv
 
 Models/

@@ -26,7 +26,7 @@ from .state_models import ConversationState, CartLine
 from .faq_search import FAQSearchEngine, FAQMatch
 from .domain_models import MenuItem, FAQEntry, MenuOption  # adjust imports if needed
 from . import guardrails
-# from .logging_utils import log_turn  # TODO: integrate laters
+from .logging_utils import append_success_pair
 
 
 @dataclass
@@ -228,7 +228,6 @@ class DialogueManager:
 
         # 4) Intent detection
         intent_label, confidence = self.intent_classifier.predict_intent(raw)
-        self.state.last_intent = intent_label
 
         # NEW: override misclassified calorie math expressions
         # e.g. "Latte grande + vanilla × 2" should be ASK_CALORIES, not ADD_TO_CART
@@ -253,7 +252,7 @@ class DialogueManager:
             # Otherwise: generic fallback
             return self._handle_fallback(raw)
 
-        # 3) Dispatch to intent-specific handlers
+        # 5) Dispatch to intent-specific handlers
         handler_map = {
             IntentLabel.GREET: self._handle_greet,
             IntentLabel.ASK_OPENING_HOURS: self._handle_opening_hours,
@@ -279,10 +278,13 @@ class DialogueManager:
         handler = handler_map.get(intent_label)
 
         if handler is None:
-            # Unknown / not yet wired intent label
+            # Unknown or not yet wired intent label
             return self._handle_fallback(raw)
 
         response = handler(raw)
+
+        # Record the successfully handled intent for future turns / analytics
+        self.state.last_intent = intent_label
 
         # TODO later:
         # - integrate guardrails (mood, abusive language, privacy)
@@ -662,6 +664,13 @@ class DialogueManager:
                 )
             )
 
+        # Log this as a clearly successful add to cart interaction
+        try:
+            append_success_pair(user_text, IntentLabel.ADD_TO_CART)
+        except Exception:
+            # Logging must never break the chat
+            pass
+
         if selected_option_ids:
             options_label = self._format_options_summary(selected_option_ids)
             return f"Added {item.name} ({options_label}) to your cart."
@@ -834,7 +843,7 @@ class DialogueManager:
 
         return f"Here’s what’s in your cart:\n{cart_text}"
 
-    def _handle_checkout(self, _: str) -> str:
+    def _handle_checkout(self, user_text: str) -> str:
         """
         Transaction-state rule:
         - You can only checkout if there is at least one item in the cart.
@@ -846,13 +855,49 @@ class DialogueManager:
         # later you can compute price, calories, etc.
         summary = self._handle_show_cart("")
         self.state.cart.clear()
+
+        # Log this successful CHECKOUT intent
+        try:
+            append_success_pair(user_text, IntentLabel.CHECKOUT)
+        except Exception:
+            pass
+
         return summary + "\n\nYour order has been placed. Thank you!"
 
     # ------------------------------------------------------------------
     # Handlers: social / feedback
     # ------------------------------------------------------------------
 
-    def _handle_user_thanks(self, _: str) -> str:
+    def _handle_user_thanks(self, user_text: str) -> str:
+        """
+        Handle USER_THANKS:
+        - Reply politely.
+        - Log this as a successful 'user_thanks' example.
+        - Additionally, if the *previous* intent looked like a contentful task
+          (e.g. ASK_ITEM_ALLERGENS, ASK_CALORIES, ADD_TO_CART, CHECKOUT),
+          log a synthetic positive-feedback marker for that intent too.
+        """
+        # 1) Log the thanks utterance itself
+        try:
+            append_success_pair(user_text, IntentLabel.USER_THANKS)
+        except Exception:
+            pass
+
+        # 2) Log a 'success' marker for the previous contentful intent, if any
+        prev_intent = getattr(self.state, "last_intent", None)
+        if prev_intent and prev_intent not in {
+            IntentLabel.USER_THANKS,
+            IntentLabel.USER_COMPLAINT,
+            IntentLabel.USER_ANGRY,
+            IntentLabel.USER_INSULT,
+            IntentLabel.OUT_OF_SCOPE,
+        }:
+            try:
+                marker_utterance = f"[positive_feedback_for:{prev_intent.value}]"
+                append_success_pair(marker_utterance, prev_intent)
+            except Exception:
+                pass
+
         replies = [
             "You’re welcome!",
             "Happy to help 😊",
