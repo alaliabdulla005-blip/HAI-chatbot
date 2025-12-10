@@ -886,27 +886,48 @@ class DialogueManager:
 
         lines: List[str] = []
         total_kcal: float = 0.0
+        total_price: float = 0.0
 
         for line in self.state.cart:
             line_kcal = self._estimate_line_calories(line)
+            line_price = self._estimate_line_price(line)
+
             total_kcal += line_kcal
+            total_price += line_price
 
             options_summary = self._format_options_summary(
                 getattr(line, "selected_options", []) or []
             )
+
             if options_summary:
                 base_desc = f"{line.item_name} × {line.quantity} ({options_summary})"
             else:
                 base_desc = f"{line.item_name} × {line.quantity}"
 
+            parts: List[str] = [base_desc]
+
+            if line_price > 0:
+                parts.append(f"~£{line_price:.2f}")
             if line_kcal > 0:
-                lines.append(f"- {base_desc}: ~{line_kcal:.0f} kcal")
-            else:
-                lines.append(f"- {base_desc}")
+                parts.append(f"~{line_kcal:.0f} kcal")
+
+            lines.append("- " + " — ".join(parts))
 
         cart_text = "\n".join(lines)
 
-        if total_kcal > 0:
+        # Build total line depending on what we have
+        if total_price > 0 and total_kcal > 0:
+            return (
+                f"Here’s what’s in your cart:\n{cart_text}\n\n"
+                f"Estimated total: **£{total_price:.2f}** and "
+                f"**~{total_kcal:.0f} kcal** for your whole cart."
+            )
+        elif total_price > 0:
+            return (
+                f"Here’s what’s in your cart:\n{cart_text}\n\n"
+                f"Estimated total: **£{total_price:.2f}** for your whole cart."
+            )
+        elif total_kcal > 0:
             return (
                 f"Here’s what’s in your cart:\n{cart_text}\n\n"
                 f"Estimated total: **~{total_kcal:.0f} kcal** for your whole cart."
@@ -1430,6 +1451,33 @@ class DialogueManager:
             if not opt:
                 continue
             delta = getattr(opt, "calories_delta_kcal", 0.0) or 0.0
+            per_unit += delta
+
+        return per_unit * max(line.quantity, 1)
+
+    def _estimate_line_price(self, line: CartLine) -> float:
+        """
+        Estimate total price for a cart line.
+
+        - MenuItem.base_price is the default Tall/Regular (or single) price.
+        - Each option in line.selected_options adds MenuOption.price_delta.
+        """
+        # Find the base menu item
+        base_item: Optional[MenuItem] = None
+        for item in self.menu_items:
+            if item.item_id == line.item_id:
+                base_item = item
+                break
+
+        base_price = (getattr(base_item, "base_price_gbp", 0.0) or 0.0)
+        per_unit = base_price
+
+        # Add all selected options (duplicates mean multiples, e.g. vanilla × 2)
+        for opt_id in getattr(line, "selected_options", []) or []:
+            opt = self.options_by_id.get(opt_id)
+            if not opt:
+                continue
+            delta = getattr(opt, "price_delta", 0.0) or 0.0
             per_unit += delta
 
         return per_unit * max(line.quantity, 1)
