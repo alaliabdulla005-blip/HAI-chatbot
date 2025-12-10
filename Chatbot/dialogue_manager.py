@@ -36,6 +36,12 @@ class ChatbotConfig:
     faq_min_score: float = 0.25
     faq_top_k: int = 3
 
+    # Guardrail thresholds / decay
+    max_anger_turns: int = 3
+    max_abuse_turns: int = 3
+    anger_decay_per_turn: int = 1      # how much to decrement anger_count on neutral turns
+    abuse_decay_per_turn: int = 1      # how much to decrement abuse_count on neutral turns
+
 
 # Fallback messages when the bot don't understand
 FALLBACK_MESSAGES = FALLBACK_MESSAGES = [
@@ -164,7 +170,14 @@ class DialogueManager:
             return random.choice(FALLBACK_MESSAGES)
 
         # 1) Guardrails pass
-        gr_result = guardrails.apply_guardrails(user_text=raw, state=self.state)
+        gr_result = guardrails.apply_guardrails(
+            user_text=raw,
+            state=self.state,
+            max_anger_turns=self.config.max_anger_turns,
+            max_abuse_turns=self.config.max_abuse_turns,
+            anger_decay=self.config.anger_decay_per_turn,
+            abuse_decay=self.config.abuse_decay_per_turn,
+        )
         if gr_result is not None:
             return gr_result
 

@@ -7,6 +7,8 @@ from typing import Optional
 
 from .state_models import ConversationState
 from .intents import IntentLabel  # for emotional-intent filtering
+from .logging_utils import append_guardrail_event
+
 
 # ----------- Simple regexes for sensitive info -----------
 
@@ -104,14 +106,22 @@ def filter_emotional_intent(
     return intent_label
 
 
-def apply_guardrails(user_text: str, state: ConversationState) -> Optional[str]:
+def apply_guardrails(
+    user_text: str,
+    state: ConversationState,
+    *,
+    max_anger_turns: int = 3,
+    max_abuse_turns: int = 3,
+    anger_decay: int = 1,
+    abuse_decay: int = 1,
+) -> Optional[str]:
     """
     Global guardrail pass.
 
     - Self-harm / crisis messages → short-circuit to a supportive message.
     - Obvious privacy leaks (card, email, phone) → short-circuit to a warning.
-    - Repeated abuse / anger → escalate to "please talk to staff / stopping chat".
-    - Otherwise → return None so DialogueManager proceeds as normal.
+    - Repeated abuse / anger → escalate to 'please talk to staff / stopping chat'.
+    - Anger/abuse counters decay slightly on neutral turns.
     """
     lowered = (user_text or "").lower()
 
@@ -120,6 +130,11 @@ def apply_guardrails(user_text: str, state: ConversationState) -> Optional[str]:
     # ------------------------------------------------------
     for pattern in SELF_HARM_PATTERNS:
         if re.search(pattern, lowered):
+            try:
+                append_guardrail_event("self_harm_pattern", user_text, details=pattern)
+            except Exception:
+                pass
+
             return (
                 "I’m really sorry that you’re feeling like this. "
                 "I’m just a café assistant and I can’t provide the right kind of help, "
@@ -131,51 +146,108 @@ def apply_guardrails(user_text: str, state: ConversationState) -> Optional[str]:
     # 2) Privacy guardrails: obvious sensitive info
     # ------------------------------------------------------
     if CARD_PATTERN.search(user_text):
+        try:
+            append_guardrail_event("card_block", user_text)
+        except Exception:
+            pass
+
         return (
             "Please don’t enter card numbers or payment details here – this chat is only for "
             "menu questions and placing café orders. You can pay safely using the payment terminal."
         )
 
     if EMAIL_PATTERN.search(user_text) or PHONE_PATTERN.search(user_text):
+        try:
+            append_guardrail_event("contact_block", user_text)
+        except Exception:
+            pass
+
         return (
             "You don’t need to share your email address or phone number here. "
             "I can still help with menu questions and your cart without that."
         )
 
     # ------------------------------------------------------
-    # 3) Escalation for repeated abuse towards the bot
+    # 3) Emotional / abuse guardrails with decay
     # ------------------------------------------------------
     flags = get_emotion_flags(lowered)
+    is_anger = flags["anger"]
+    is_insult = flags["insult"]
+    # complaint is handled at the dialogue level; here we only care about counts
 
-    if flags["insult"]:
+    # Neutral turn (no anger/insult) → decay counters gently
+    if not (is_anger or is_insult):
+        if anger_decay:
+            state.anger_count = max(0, getattr(state, "anger_count", 0) - anger_decay)
+        if abuse_decay:
+            state.abuse_count = max(0, getattr(state, "abuse_count", 0) - abuse_decay)
+
+    # Abuse branch
+    if is_insult:
         abuse_count = getattr(state, "abuse_count", 0) + 1
-        setattr(state, "abuse_count", abuse_count)
+        state.abuse_count = abuse_count
 
-        # After 3 abusive turns, stop the chat politely
-        if abuse_count >= 3:
+        try:
+            append_guardrail_event(
+                "abuse_turn",
+                user_text,
+                details=f"abuse_count={abuse_count}",
+            )
+        except Exception:
+            pass
+
+        # After N abusive turns, stop the chat politely
+        if abuse_count >= max_abuse_turns:
+            try:
+                append_guardrail_event(
+                    "abuse_escalated",
+                    user_text,
+                    details=f"abuse_count={abuse_count}",
+                )
+            except Exception:
+                pass
+
             return (
                 "Because of the language being used, I’m going to stop this chat now. "
                 "If you still need help with your order, a staff member can assist you in person."
             )
+
         # For the first / second insult, let the normal USER_INSULT intent reply handle it.
-        # So: no short-circuit, just continue.
         return None
 
-    # ------------------------------------------------------
-    # 4) Escalation for repeated strong anger (without abuse)
-    # ------------------------------------------------------
-    if flags["anger"]:
+    # Anger branch (strong frustration, but not explicit abuse)
+    if is_anger:
         anger_count = getattr(state, "anger_count", 0) + 1
-        setattr(state, "anger_count", anger_count)
+        state.anger_count = anger_count
 
-        # After 3 strongly angry turns, gently redirect to human staff
-        if anger_count >= 3:
+        try:
+            append_guardrail_event(
+                "anger_turn",
+                user_text,
+                details=f"anger_count={anger_count}",
+            )
+        except Exception:
+            pass
+
+        # After N angry turns, gently redirect to human staff
+        if anger_count >= max_anger_turns:
+            try:
+                append_guardrail_event(
+                    "anger_escalated",
+                    user_text,
+                    details=f"anger_count={anger_count}",
+                )
+            except Exception:
+                pass
+
             return (
                 "It sounds like this is really frustrating. I’m only a simple café bot – "
                 "you might find it easier to speak directly to a staff member who can help you."
             )
 
     # ------------------------------------------------------
-    # 5) Default: allow normal handling
+    # 4) Default: allow normal handling
     # ------------------------------------------------------
     return None
+
+
