@@ -144,6 +144,7 @@ class DialogueManager:
         self.options_by_id = {opt.option_id: opt for opt in self.menu_options}
         self.config = config or ChatbotConfig()
         self.state = ConversationState()
+        self._sugar_free_notes: List[str] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -736,9 +737,16 @@ class DialogueManager:
 
         if selected_option_ids:
             options_label = self._format_options_summary(selected_option_ids)
-            return f"Added {item.name} ({options_label}) to your cart."
+            base_reply = f"Added {item.name} ({options_label}) to your cart."
+        else:
+            base_reply = f"Added {item.name} to your cart."
 
-        return f"Added {item.name} to your cart."
+        # Attach any sugar-free fallback explanations
+        notes = self._consume_sugar_free_notes()
+        if notes:
+            return base_reply + "\n\n" + "\n".join(notes)
+
+        return base_reply
 
     def _is_clear_cart_command(self, lowered: str) -> bool:
         """
@@ -1060,7 +1068,8 @@ class DialogueManager:
         TOKEN_NORMALISATIONS = {
             "choc": "chocolate",  # so "hot choc" matches "Hot Chocolate"
             "soy": "soya",
-            "mist": "misto",# treat "soy" the same as "soya"
+            "mist": "misto",
+            "grand":"grande",# treat "soy" the same as "soya"
         }
 
         tokens: List[str] = []
@@ -1137,16 +1146,27 @@ class DialogueManager:
             """
             Check options.csv `applies_to_scope` (item_id:... | category:...).
             If scope is blank, treat as global.
+
+            Special case:
+            - 'size' options are treated as generic (short / tall / grande / venti / regular / large)
+              and allowed for any Beverage item. We rely on the text tokens to decide WHICH size
+              is actually used.
             """
             if base_item is None:
+                # For standalone segments (e.g. pure "vanilla syrup x 2"), treat options as global.
+                return True
+
+            item_id = getattr(base_item, "item_id", "")
+            category = (getattr(base_item, "category", "") or "").lower()
+            group = (opt.option_group or "").lower()
+
+            # Sizes: allow for any beverage, regardless of the CSV scope
+            if group == "size" and category == "beverage":
                 return True
 
             scope = (opt.applies_to_scope or "").strip()
             if not scope:
                 return True
-
-            item_id = getattr(base_item, "item_id", "")
-            category = (getattr(base_item, "category", "") or "").lower()
 
             for clause in scope.split("|"):
                 clause = clause.strip()
@@ -1245,41 +1265,63 @@ class DialogueManager:
                     per_type[sf_key] = (opt, qty)
                 else:
                     prev_opt, prev_qty = existing
-                    per_type[sf_key] = (prev_opt, prev_qty + qty)
+                    per_type[sf_key] = (prev_opt, max(prev_qty, qty))
 
         # Turn the bucket into a flat list, applying sugar_free preference / fallback
         results: List[tuple[MenuOption, int]] = []
 
         for (group, core), per_type in bucket.items():
-            normal = per_type.get("normal")
+            normal = per_type.get("normal")  # (MenuOption, qty) or None
             sugar_free = per_type.get("sugar_free")
 
+            chosen: Optional[tuple[MenuOption, int]] = None
+
             if group == "syrup":
-                if sugar_free_requested:
-                    # Prefer sugar-free; if not available for this drink, fall back to normal
-                    if sugar_free is not None:
-                        results.append(sugar_free)
-                    elif normal is not None:
-                        results.append(normal)
+                if sugar_free_requested and sugar_free is not None:
+                    # User asked for sugar-free and we have it
+                    chosen = sugar_free
+                elif sugar_free_requested and sugar_free is None and normal is not None:
+                    # User asked for sugar-free but we only have the normal syrup
+                    chosen = normal
+
+                    opt_obj, _opt_qty = normal
+                    try:
+                        label = self._format_option_label(opt_obj, 1)
+                        note = (
+                            "You asked for a sugar-free syrup, but I don’t have a sugar-free "
+                            f"version of **{label}** for this drink, so I’ve added the regular syrup instead."
+                        )
+                    except Exception:
+                        note = (
+                            "You asked for a sugar-free syrup, but I don’t have a sugar-free "
+                            "version for this drink, so I’ve added the regular syrup instead."
+                        )
+                    self._sugar_free_notes.append(note)
                 else:
-                    # Prefer normal; if not available (rare), fall back to sugar-free
-                    if normal is not None:
-                        results.append(normal)
-                    elif sugar_free is not None:
-                        results.append(sugar_free)
-                        milk_indices = [
-                            i for i, (opt, _qty) in enumerate(results)
-                            if (opt.option_group or "").lower() == "milk"
-                        ]
-                        if len(milk_indices) > 1:
-                            last_idx = milk_indices[-1]
-                            chosen_opt, chosen_qty = results[last_idx]
-                            # Drop all milks, then re-add the chosen one
-                            results = [
-                                pair for pair in results
-                                if (pair[0].option_group or "").lower() != "milk"
-                            ]
-                            results.append((chosen_opt, chosen_qty))
+                    # No sugar-free requested: prefer normal; fall back to sugar-free if needed
+                    chosen = normal or sugar_free
+            else:
+                # Non-syrup groups (size, milk, toppings, sweeteners, extra shots, other):
+                # always prefer "normal" over "sugar_free" variant if both exist.
+                chosen = normal or sugar_free
+
+            if chosen is not None:
+                results.append(chosen)
+
+        # Ensure at most one milk option is applied: keep the last explicitly mentioned one
+        milk_indices = [
+            i for i, (opt, _qty) in enumerate(results)
+            if (opt.option_group or "").lower() == "milk"
+        ]
+        if len(milk_indices) > 1:
+            last_idx = milk_indices[-1]
+            chosen_opt, chosen_qty = results[last_idx]
+            # Drop all milks, then re-add the last one mentioned
+            results = [
+                pair for pair in results
+                if (pair[0].option_group or "").lower() != "milk"
+            ]
+            results.append((chosen_opt, chosen_qty))
 
         return results
 
@@ -1427,7 +1469,8 @@ class DialogueManager:
         """
         Handle normal questions like:
         - "how many calories in a latte?"
-        - "cals in tall misto"
+        - "calories in large latte with vanilla syrup?"
+        - "cals in grande flat white with oat milk"
         """
         item = self._find_menu_item_in_text_relaxed(user_text)
         if item is None:
@@ -1435,10 +1478,10 @@ class DialogueManager:
             faq = self.faq_engine.get_faq_by_id("calorie_math")
             if faq:
                 return (
-                    "Tell me the drink or food you’re asking about "
-                    "(for example, “Latte” or “Blueberry Muffin”), "
-                    "and I’ll look up its calories.\n\n"
-                    + faq.answer_markdown
+                        "Tell me the drink or food you’re asking about "
+                        "(for example, “Latte” or “Blueberry Muffin”), "
+                        "and I’ll look up its calories.\n\n"
+                        + faq.answer_markdown
                 )
             return (
                 "Tell me the drink or food you’re asking about "
@@ -1446,154 +1489,205 @@ class DialogueManager:
                 "and I’ll look up its calories."
             )
 
-        kcal = getattr(item, "calories_kcal", 0.0) or 0.0
+        base_kcal = (getattr(item, "calories_kcal", 0.0) or 0.0)
+
+        # NEW: parse options (size, milk, syrups, shots, toppings, sweeteners)
+        opt_pairs = self._parse_options_from_text(user_text, base_item=item)
+        selected_option_ids: List[str] = []
+        for opt, qty in opt_pairs:
+            for _ in range(max(qty, 1)):
+                selected_option_ids.append(opt.option_id)
+
+        if selected_option_ids:
+            # Reuse the same logic as the cart so behaviour is consistent
+            temp_line = CartLine(
+                item_id=item.item_id,
+                item_name=item.name,
+                quantity=1,
+                selected_options=selected_option_ids,
+            )
+            kcal = self._estimate_line_calories(temp_line)
+            options_summary = self._format_options_summary(selected_option_ids)
+            label = f"{item.name} ({options_summary})"
+        else:
+            kcal = base_kcal
+            label = item.name
+
         if kcal <= 0.0:
             faq = self.faq_engine.get_faq_by_id("calorie_math")
             extra = "\n\n" + faq.answer_markdown if faq else ""
             return (
-                f"I couldn’t find calorie data for **{item.name}** in my menu yet."
-                + extra
+                    f"I couldn’t find calorie data for **{label}** in my menu yet."
+                    + extra
             )
 
-        return (
-            f"Based on our menu data, **{item.name}** has about **{kcal:.0f} kcal** per serving "
-            "before any extra syrups, toppings or size changes.\n\n"
-            f"{CALORIE_DISCLAIMER}"
-        )
+        # Sugar-free fallback explanation, if any, same as in cart / expression paths
+        sugar_notes = self._consume_sugar_free_notes()
+        extra_notes = "\n\n" + "\n".join(sugar_notes) if sugar_notes else ""
+
+        if selected_option_ids:
+            main = (
+                f"Based on our menu data, **{label}** has about **{kcal:.0f} kcal** "
+                f"for this configuration."
+            )
+        else:
+            main = (
+                f"Based on our menu data, **{label}** has about **{kcal:.0f} kcal** "
+                "per serving before any extra syrups, toppings or size changes."
+            )
+
+        return main + extra_notes + "\n\n" + CALORIE_DISCLAIMER
 
     def _answer_calorie_expression(self, user_text: str) -> str:
         """
         Handle expressions like:
         - "latte + muffin"
         - "latte x 2 + blueberry muffin"
-        - "latte + vanilla syrup x 2 + extra shot"
+        - "grande latte + vanilla syrup x 2"
 
-        We sum:
-        - base calories from menu items, and
-        - delta calories from options (syrups, extra shots, milks, etc.)
-          using options.csv.
+        We now:
+        - Treat each '+' segment as a mini "order line".
+        - For segments that contain a menu item, we attach any sizes / milks /
+          syrups / shots mentioned in *that* segment and use _estimate_line_calories.
+        - For segments that only contain options (e.g. "vanilla syrup x 2"),
+          we treat them as extra standalone kcal on top.
         """
         text = (user_text or "").strip()
         if not text:
             return self._answer_calorie_simple(user_text)
 
-        # Split by '+' as the top-level separator
         parts = re.split(r"\s*\+\s*", text)
 
-        item_contribs: List[tuple[MenuItem, int]] = []
-        option_contribs: List[tuple[MenuOption, int]] = []
+        # Per-item segments: [{item, qty, option_ids, kcal_total}, ...]
+        item_segments: List[dict] = []
+        # Standalone options (no associated item in that segment)
+        extra_options_agg: dict[str, tuple[MenuOption, int]] = {}
         unknown_segments: List[str] = []
 
         for raw_part in parts:
-            part = raw_part.strip()
-            if not part:
+            expr_seg = raw_part.strip()
+            if not expr_seg:
                 continue
 
-            # Look for quantity patterns: "x 2", "×2", "*2", "times 2"
+            # Expression-level quantity for the whole segment, e.g. "2x latte"
             qty = 1
-            segment_for_match = part
+            segment_for_item = expr_seg
 
-            m = re.search(r"(?:x|×|\*|\btimes\b)\s*(\d+)", part, flags=re.IGNORECASE)
+            # Patterns: "latte x 2", "latte × 2", "latte * 2", "latte times 2"
+            m = re.search(r"(?:x|×|\*|\btimes\b)\s*(\d+)", expr_seg, flags=re.IGNORECASE)
+            if not m:
+                # Also support "2x latte", "2 x latte"
+                m = re.search(r"(\d+)\s*(?:x|×|\*)", expr_seg, flags=re.IGNORECASE)
+
             if m:
                 try:
-                    qty = int(m.group(1))
+                    qty = max(int(m.group(1)), 1)
                 except ValueError:
                     qty = 1
-                segment_for_match = re.sub(
-                    r"(?:x|×|\*|\btimes\b)\s*\d+",
+
+                # Strip the quantity marker from the *item-matching* text,
+                # but keep the full expr_seg (with "x 2") for option parsing.
+                segment_for_item = re.sub(
+                    r"(?:x|×|\*|\btimes\b)\s*\d+|\d+\s*(?:x|×|\*)",
                     "",
-                    part,
+                    expr_seg,
                     flags=re.IGNORECASE,
                 ).strip()
+
+            # Try to identify a menu item in this segment
+            item = self._find_menu_item_in_text_relaxed(segment_for_item)
+            base_kcal = (getattr(item, "calories_kcal", 0.0) or 0.0) if item else 0.0
+
+            if item is not None and base_kcal > 0.0:
+                # Options tied to this item – parse from the full segment so
+                # things like "vanilla syrup x 2" are visible to the parser.
+                opt_pairs = self._parse_options_from_text(expr_seg, base_item=item)
+                selected_option_ids: List[str] = []
+                for opt, opt_qty in opt_pairs:
+                    for _ in range(max(opt_qty, 1)):
+                        selected_option_ids.append(opt.option_id)
+
+                temp_line = CartLine(
+                    item_id=item.item_id,
+                    item_name=item.name,
+                    quantity=max(qty, 1),
+                    selected_options=selected_option_ids,
+                )
+                seg_kcal = self._estimate_line_calories(temp_line)
+
+                item_segments.append(
+                    {
+                        "item": item,
+                        "qty": max(qty, 1),
+                        "option_ids": selected_option_ids,
+                        "kcal_total": seg_kcal,
+                    }
+                )
             else:
-                # Also support patterns like "2x latte"
-                m2 = re.search(r"(\d+)\s*(?:x|×|\*)", part, flags=re.IGNORECASE)
-                if m2:
-                    try:
-                        qty = int(m2.group(1))
-                    except ValueError:
-                        qty = 1
-                    segment_for_match = re.sub(
-                        r"\d+\s*(?:x|×|\*)",
-                        "",
-                        part,
-                        flags=re.IGNORECASE,
-                    ).strip()
-
-            # Try to match this segment to a menu item
-            item = self._find_menu_item_in_text_relaxed(segment_for_match)
-            kcal = getattr(item, "calories_kcal", 0.0) if item else 0.0
-
-            if item is not None and kcal > 0.0:
-                item_contribs.append((item, max(qty, 1)))
-
-                # also look for options *within* this item phrase
-                opt_pairs = self._parse_options_from_text(segment_for_match, base_item=item)
-                option_contribs.extend(opt_pairs)
-            else:
-                # No menu item → maybe this is pure options like "vanilla syrup x 2"
-                opt_pairs = self._parse_options_from_text(segment_for_match, base_item=None)
+                # No clear menu item → maybe this is "vanilla syrup x 2" etc.
+                opt_pairs = self._parse_options_from_text(expr_seg, base_item=None)
                 if opt_pairs:
-                    option_contribs.extend(opt_pairs)
-                elif segment_for_match:
-                    unknown_segments.append(segment_for_match)
+                    # Aggregate standalone options so "vanilla syrup x 2" +
+                    # "vanilla syrup" becomes qty=3.
+                    for opt, opt_qty in opt_pairs:
+                        # Multiply by the segment quantity if present
+                        add_qty = max(opt_qty, 1)
+                        current = extra_options_agg.get(opt.option_id)
+                        if current is None:
+                            extra_options_agg[opt.option_id] = (opt, add_qty)
+                        else:
+                            _, prev_qty = current
+                            extra_options_agg[opt.option_id] = (opt, prev_qty + add_qty)
+                elif segment_for_item:
+                    # Something we couldn't match at all
+                    unknown_segments.append(segment_for_item)
 
-        if not item_contribs and not option_contribs:
-            # Nothing matched – fall back to simple behaviour
+        # If nothing intelligible, fall back to single-item handling
+        if not item_segments and not extra_options_agg:
             return self._answer_calorie_simple(user_text)
 
-        total_items_kcal = sum(
-            (getattr(item, "calories_kcal", 0.0) or 0.0) * qty
-            for item, qty in item_contribs
-        )
-
-        # Aggregate options by option_id
-        option_agg: dict[str, tuple[MenuOption, int]] = {}
-        for opt, qty in option_contribs:
-            current = option_agg.get(opt.option_id)
-            if current is None:
-                option_agg[opt.option_id] = (opt, max(qty, 1))
-            else:
-                option_agg[opt.option_id] = (opt, current[1] + max(qty, 1))
-
-        total_options_kcal = sum(
-            (getattr(opt, "calories_delta_kcal", 0.0) or 0.0) * qty
-            for opt, qty in option_agg.values()
-        )
-
-        total_kcal = total_items_kcal + total_options_kcal
-
         lines: List[str] = ["Here’s an approximate calorie breakdown:"]
+        total_kcal: float = 0.0
 
-        # Base items
-        for item, qty in item_contribs:
-            per = getattr(item, "calories_kcal", 0.0) or 0.0
-            if qty <= 1:
-                lines.append(f"- {item.name}: about {per:.0f} kcal.")
+        # --- Item segments (drinks/foods, possibly with options) ---
+        for seg in item_segments:
+            item = seg["item"]
+            qty = seg["qty"]
+            option_ids = seg["option_ids"]
+            seg_kcal = seg["kcal_total"]
+            total_kcal += seg_kcal
+
+            options_summary = self._format_options_summary(option_ids)
+            if options_summary:
+                label = f"{item.name} ({options_summary})"
             else:
+                label = item.name
+
+            if qty <= 1:
+                lines.append(f"- {label}: about {seg_kcal:.0f} kcal.")
+            else:
+                per_unit = seg_kcal / qty if qty > 0 else seg_kcal
                 lines.append(
-                    f"- {item.name} × {qty}: about {per:.0f} kcal each = {per * qty:.0f} kcal."
+                    f"- {label} × {qty}: about {per_unit:.0f} kcal each = {seg_kcal:.0f} kcal."
                 )
 
-        # Options
-        if option_agg:
+        # --- Standalone extras (options-only segments) ---
+        if extra_options_agg:
             lines.append("")
-            lines.append("Options:")
-            for opt_id, (opt, qty) in option_agg.items():
+            lines.append("Extra options not tied to a specific drink/food:")
+            for opt_id, (opt, qty) in extra_options_agg.items():
                 delta = getattr(opt, "calories_delta_kcal", 0.0) or 0.0
                 label = self._format_option_label(opt, qty)
                 if qty <= 1:
                     lines.append(f"- {label}: adds ~{delta:.0f} kcal.")
+                    total_kcal += delta
                 else:
                     lines.append(
                         f"- {label}: about {delta:.0f} kcal each = {delta * qty:.0f} kcal."
                     )
+                    total_kcal += delta * qty
 
-        lines.append("")
-        lines.append(
-            f"**Estimated total: ~{total_kcal:.0f} kcal** (base items + options)."
-        )
-
+        # --- Unknown bits (we don't pretend to know them) ---
         if unknown_segments:
             unique_unknown = sorted({seg for seg in unknown_segments})
             lines.append("")
@@ -1604,7 +1698,17 @@ class DialogueManager:
                 + "."
             )
 
-        # New: append the disclaimer for expression-based answers as well
+        # Sugar-free fallback explanations (if any were triggered)
+        sugar_notes = self._consume_sugar_free_notes()
+        if sugar_notes:
+            lines.append("")
+            lines.extend(sugar_notes)
+
+        # Final total summary
+        lines.append("")
+        lines.append(
+            f"Estimated total for everything you described: **~{total_kcal:.0f} kcal**."
+        )
         lines.append("")
         lines.append(CALORIE_DISCLAIMER)
 
@@ -1751,6 +1855,22 @@ class DialogueManager:
 
         # Reuse the existing tie-breaking heuristics
         return self._break_tie(user_tokens_all, recognised_tokens, candidates)
+
+    def _consume_sugar_free_notes(self) -> List[str]:
+        """
+        Return any sugar-free fallback notes accumulated during option parsing
+        and clear them for the next turn (deduplicated, order-preserving).
+        """
+        raw = getattr(self, "_sugar_free_notes", [])
+        # dedupe while preserving order
+        seen = set()
+        notes: List[str] = []
+        for n in raw:
+            if n not in seen:
+                seen.add(n)
+                notes.append(n)
+        self._sugar_free_notes = []
+        return notes
 
 
     def _break_tie(
