@@ -22,7 +22,7 @@ import re
 from collections import Counter
 
 from .intents import SklearnIntentClassifier, IntentLabel
-from .state_models import ConversationState, CartLine
+from .state_models import ChatState, CartLine, FlowContext
 from .faq_search import FAQSearchEngine, FAQMatch
 from .domain_models import MenuItem, FAQEntry, MenuOption  # adjust imports if needed
 from . import guardrails
@@ -91,6 +91,8 @@ class DialogueManager:
     UI layers (CLI, Streamlit) should call `handle_message()` and display
     the returned text.
     """
+    ORDER_WIZARD_FLOW = "order_wizard"
+
 
     GREET_KEYWORDS = {
         "hi","hello","hey","good morning","good afternoon",
@@ -106,8 +108,9 @@ class DialogueManager:
         "with", "without", "of", "for", "to", "in", "on", "at",
         "my", "your", "our", "their", "its", "it", "i", "you", "we", "they",
         "please", "pls", "can", "could", "would", "will", "shall", "should",
-        "any", "some", "just",
-        "what", "which", "how", "many", "much",
+        "any", "some", "just", "and", "or", "plus",
+        "what", "which", "how", "many", "much", "milk", "dairy", "lactose", "drink", "semi",
+        "skimmed", "whole",
 
         # allergen / question words that shouldn't drive item matching
         "contains", "contain", "containing",
@@ -134,6 +137,15 @@ class DialogueManager:
         "one", "two", "three", "1", "2", "3",
     }
 
+    ALLERGEN_CUES = {
+        "allergen", "allergens", "allergy", "allergic",
+        "contain", "contains", "may contain",
+        "milk", "dairy", "lactose",
+        "egg", "eggs", "nuts", "peanut", "gluten", "wheat", "soy", "soya", "sesame", "mustard",
+    }
+
+    CALORIE_CUES = {"calorie", "calories", "kcal", "cals"}
+
     def __init__(
         self,
         intent_classifier: SklearnIntentClassifier,
@@ -148,8 +160,9 @@ class DialogueManager:
         self._menu_vocab = self._build_menu_vocab(self.menu_items)
         self.menu_options = list(menu_options) if menu_options is not None else []
         self.options_by_id = {opt.option_id: opt for opt in self.menu_options}
+        self._option_vocab = self._build_option_vocab(self.menu_options)
         self.config = config or ChatbotConfig()
-        self.state = ConversationState()
+        self.state = ChatState()
         self._sugar_free_notes: List[str] = []
 
     # ------------------------------------------------------------------
@@ -188,7 +201,26 @@ class DialogueManager:
         if self.state.awaiting_bot_name:
             return self._handle_bot_name_reply(raw)
 
+        if self.state.awaiting_item_for_pending_options:
+            return self._handle_pending_options_item(raw)
+
+        if self.state.active_flow is not None:
+            return self._route_active_flow(raw)
+
         lowered = raw.lower()
+
+        # Start a guided order wizard on natural phrases
+        if (
+                "help me choose" in lowered
+                or "guide my order" in lowered
+                or "start order" in lowered
+                or "recommend a drink" in lowered
+                or "recommend something to drink" in lowered
+                or "recommend food" in lowered
+                or "recommend something to eat" in lowered
+        ):
+            # Pass the raw user text so we can inspect it in _start_order_wizard
+            return self._start_order_wizard(raw)
 
         # 3) Direct question about the stored name
         if "what is my name" in lowered or "what's my name" in lowered or "whats my name" in lowered:
@@ -240,6 +272,48 @@ class DialogueManager:
             if re.match(pattern, lowered):
                 return self._handle_greet(raw)
 
+        # options guard
+        if self._looks_like_options_only(raw):
+            self.state.pending_options_queue.append(raw)
+            self.state.awaiting_item_for_pending_options = True
+            return "Those sound like customisations (milk/syrups/shots). Which drink or food should I apply them to?"
+
+        # If the user explicitly mentions calories, handle calories BEFORE allergen-cue overrides.
+        # This fixes cases like: "calories in latte with oat milk ..."
+        ORDERish = {"add", "remove", "delete", "checkout", "order", "buy", "put"}
+        if any(cue in lowered for cue in self.CALORIE_CUES):
+            if not any(f" {w} " in f" {lowered} " for w in ORDERish):
+                return self._handle_calories(raw)
+
+        # allergen cue override (avoid overriding order commands)
+        if any(cue in lowered for cue in self.ALLERGEN_CUES):
+            if not any(f" {w} " in f" {lowered} " for w in ORDERish):
+                if self._find_menu_item_in_text(raw) or self._find_menu_item_in_text_relaxed(raw):
+                    return self._handle_item_allergens(raw)
+
+            # allow cancel
+            if lowered in {"cancel", "stop", "exit", "nevermind", "never mind"}:
+                self.state.awaiting_item_for_pending_options = False
+                self.state.pending_options_text = ""
+                return "Okay — I won’t apply those customisations. Which drink or food would you like?"
+
+            item = self._find_menu_item_in_text(raw) or self._find_menu_item_in_text_relaxed(raw)
+            if item is None:
+                return (
+                    "I couldn’t find that item in the menu. "
+                    "Which drink or food should I apply those customisations to? "
+                    "For example: “Latte”, “Mocha”, or “Blueberry Muffin”."
+                )
+
+            # consume pending options
+            options_text = self.state.pending_options_text
+            self.state.awaiting_item_for_pending_options = False
+            self.state.pending_options_text = ""
+
+            # add using the known item + stored options
+            log_text = f"{item.name} + {options_text}"
+            return self._add_specific_item_to_cart(item=item, options_text=options_text, log_text=log_text)
+
         # 4) Intent detection
         intent_label, confidence = self.intent_classifier.predict_intent(raw)
 
@@ -248,6 +322,9 @@ class DialogueManager:
         if self._looks_like_calorie_expression(raw):
             intent_label = IntentLabel.ASK_CALORIES
             confidence = 1.0
+
+            if self._find_menu_item_in_text_relaxed(raw) and len(raw.split()) <= 4:
+                return self._handle_calories(raw)
 
         # Let guardrails down-weight obviously misclassified emotional intents
         intent_label = guardrails.filter_emotional_intent(intent_label, lowered)
@@ -490,7 +567,7 @@ class DialogueManager:
 
     def _handle_opening_hours(self, _: str) -> str:
         # Direct lookup by FAQ ID if present, otherwise search by tag
-        faq = self.faq_engine.get_faq_by_id("openning_hours")
+        faq = self.faq_engine.get_faq_by_id("opening_hours")
         if faq:
             return faq.answer_markdown
 
@@ -696,6 +773,207 @@ class DialogueManager:
     # Handlers: cart / transaction state
     # ------------------------------------------------------------------
 
+    # Inside DialogueManager
+    # Inside DialogueManager
+    def _start_order_wizard(self, user_text: str) -> str:
+        lowered = (user_text or "").lower()
+
+        category: Optional[str] = None
+        if "drink" in lowered:
+            category = "beverage"
+        elif "food" in lowered or "snack" in lowered:
+            category = "food"
+
+        if category is not None:
+            flow = FlowContext(
+                name=self.ORDER_WIZARD_FLOW,
+                stage="ask_item",
+                data={"category": category},
+            )
+            self.state.active_flow = flow
+
+            if category == "beverage":
+                return (
+                    "Let’s pick a drink from the menu.\n\n"
+                    "What drink are you thinking about? For example, "
+                    "“Latte”, “Americano (black)” or “Mocha”."
+                )
+            else:
+                return (
+                    "Let’s pick something to eat.\n\n"
+                    "What food or snack are you thinking about? For example, "
+                    "“Blueberry Muffin” or “Cheese & Ham Toastie”."
+                )
+
+        # Ambiguous “help me choose …” → ask drink vs food first
+        flow = FlowContext(
+            name=self.ORDER_WIZARD_FLOW,
+            stage="ask_category",
+            data={},
+        )
+        self.state.active_flow = flow
+
+        return (
+            "Let’s build your order step by step.\n\n"
+            "First, are you looking for a **drink** or a **food** item?"
+        )
+
+    def _route_active_flow(self, user_text: str) -> str:
+        """
+        Route the current user turn into whichever flow is active.
+        """
+        ctx = self.state.active_flow
+        if ctx is None:
+            # Safety – fall back to normal handling if something got cleared.
+            return self._handle_fallback(user_text)
+
+        if ctx.name == self.ORDER_WIZARD_FLOW:
+            return self._order_wizard_step(user_text, ctx)
+
+        # Unknown flow – cancel it and fall back
+        self.state.active_flow = None
+        return self._handle_fallback(user_text)
+
+    def _order_wizard_step(self, user_text: str, ctx: FlowContext) -> str:
+        """
+        Handle one step of the 'order_wizard' flow.
+
+        Stages:
+        - ask_category  -> store 'drink' or 'food'
+        - ask_item      -> store the raw item phrase
+        - ask_options   -> store extras phrase, then call _handle_add_to_cart
+        """
+        text = (user_text or "").strip()
+        lowered = text.lower()
+
+        # Allow the user to cancel out of the wizard at any time
+        if lowered in {"cancel", "stop", "exit", "nevermind", "never mind"}:
+            self.state.active_flow = None
+            return (
+                "No problem – I’ve cancelled the step-by-step ordering. "
+                "You can still add items directly, for example "
+                "“add a tall latte with oat milk to my order”."
+            )
+
+        # -------- Stage 1: ask_category --------
+        if ctx.stage == "ask_category":
+            if any(w in lowered for w in ["drink", "coffee", "beverage"]):
+                ctx.data["category"] = "beverage"
+            elif any(w in lowered for w in ["food", "snack", "sandwich", "pastry"]):
+                ctx.data["category"] = "food"
+            else:
+                return (
+                    "Please say whether you want a **drink** or a **food** item, "
+                    "for example “a drink” or “a food snack”."
+                )
+
+            ctx.stage = "ask_item"
+            category = ctx.data["category"]
+
+            if category == "beverage":
+                return (
+                    "Let’s pick a drink from the menu.\n\n"
+                    "What drink are you thinking about? For example, "
+                    "“Latte”, “Americano (black)” or “Mocha”."
+                )
+            else:
+                return (
+                    "Let’s pick something to eat.\n\n"
+                    "What food or snack are you thinking about? For example, "
+                    "“Blueberry Muffin” or “Cheese & Ham Toastie”."
+                )
+
+        # -------- Stage 2: ask_item --------
+        if ctx.stage == "ask_item":
+            if len(text) < 2:
+                category = ctx.data.get("category")
+                if category == "food":
+                    return (
+                        "Could you give me the food name, "
+                        "like “Blueberry Muffin” or “Cheese & Ham Toastie”?"
+                    )
+                else:
+                    return (
+                        "Could you give me the drink name, "
+                        "like “Latte” or “Hot Chocolate”?"
+                    )
+
+            # If user accidentally includes "with ...", try to match only the left side
+            item_phrase = text
+            if re.search(r"\bwith\b", text, flags=re.IGNORECASE):
+                item_phrase = re.split(r"\bwith\b", text, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+
+            # Match item NOW and store it so options can't change it later
+            item = self._find_menu_item_in_text(item_phrase) or self._find_menu_item_in_text_relaxed(item_phrase)
+            if item is None:
+                wanted = "food" if ctx.data.get("category") == "food" else "drink"
+                return (
+                    f"I couldn’t find that {wanted} in the menu. "
+                    "Try the exact name, for example “Blueberry Muffin”, “Latte”, or “Mocha”."
+                )
+
+            # Enforce category if we can
+            chosen_cat = (ctx.data.get("category") or "").lower()
+            item_cat = (getattr(item, "category", "") or "").lower()
+            if chosen_cat and item_cat and chosen_cat != item_cat:
+                return (
+                    f"That sounds like a **{item_cat}**, but you said you want **{chosen_cat}**. "
+                    "Could you give me the exact name of the item in the category you want?"
+                )
+
+            ctx.data["selected_item_id"] = item.item_id
+            ctx.data["selected_item_name"] = item.name
+
+            ctx.stage = "ask_options"
+
+            category = ctx.data.get("category")
+            if category == "food":
+                return (
+                    "Got it. Do you want any extras?\n"
+                    "If you’re not sure, say “no extras”. (Food extras are limited in my data.)"
+                )
+
+            return (
+                "Got it. Do you want any extras like **oat milk**, **vanilla syrup**, "
+                "**extra espresso shot**, or toppings?\n"
+                "You can say “no extras” if you don’t want anything added."
+            )
+
+        # -------- Stage 3: ask_options --------
+        if ctx.stage == "ask_options":
+            if lowered in {"no", "none", "no extras", "nothing"}:
+                options_phrase = ""
+            elif "no extra" in lowered and "syrup" not in lowered:
+                options_phrase = ""
+            else:
+                options_phrase = text
+
+            # Get the stored item
+            item_id = ctx.data.get("selected_item_id")
+            item = next((m for m in self.menu_items if m.item_id == item_id), None)
+
+            # Clear flow BEFORE adding
+            self.state.active_flow = None
+
+            if item is None:
+                return self._handle_fallback(user_text)
+
+            add_reply = self._add_specific_item_to_cart(
+                item=item,
+                options_text=options_phrase,
+                log_text=user_text,
+            )
+
+            return (
+                    "Okay, I’ve used your answers to build an order and add it via "
+                    "the normal system.\n\n"
+                    + add_reply
+            )
+
+        # Unknown stage – reset flow and fall back
+        self.state.active_flow = None
+        return self._handle_fallback(user_text)
+
     def _handle_add_to_cart(self, user_text: str) -> str:
         """
         Simple add-to-cart handler:
@@ -755,6 +1033,60 @@ class DialogueManager:
             base_reply = f"Added {item.name} to your cart."
 
         # Attach any sugar-free fallback explanations
+        notes = self._consume_sugar_free_notes()
+        if notes:
+            return base_reply + "\n\n" + "\n".join(notes)
+
+        return base_reply
+
+    def _add_specific_item_to_cart(
+            self,
+            item: MenuItem,
+            options_text: str,
+            log_text: str,
+    ) -> str:
+        """
+        Add a *known* menu item to cart, parsing options only from options_text.
+        Used by the order wizard to avoid re-matching the item.
+        """
+        option_pairs = self._parse_options_from_text(options_text or "", base_item=item)
+
+        selected_option_ids: List[str] = []
+        for opt, qty in option_pairs:
+            for _ in range(max(qty, 1)):
+                selected_option_ids.append(opt.option_id)
+
+        def same_config(line: CartLine) -> bool:
+            return (
+                    line.item_id == item.item_id
+                    and sorted(line.selected_options) == sorted(selected_option_ids)
+            )
+
+        for line in self.state.cart:
+            if same_config(line):
+                line.quantity += 1
+                break
+        else:
+            self.state.cart.append(
+                CartLine(
+                    item_id=item.item_id,
+                    item_name=item.name,
+                    quantity=1,
+                    selected_options=selected_option_ids,
+                )
+            )
+
+        try:
+            append_success_pair(log_text, IntentLabel.ADD_TO_CART)
+        except Exception:
+            pass
+
+        if selected_option_ids:
+            options_label = self._format_options_summary(selected_option_ids)
+            base_reply = f"Added {item.name} ({options_label}) to your cart."
+        else:
+            base_reply = f"Added {item.name} to your cart."
+
         notes = self._consume_sugar_free_notes()
         if notes:
             return base_reply + "\n\n" + "\n".join(notes)
@@ -1103,7 +1435,8 @@ class DialogueManager:
             "choc": "chocolate",  # so "hot choc" matches "Hot Chocolate"
             "soy": "soya",
             "mist": "misto",
-            "grand":"grande",# treat "soy" the same as "soya"
+            "grand":"grande",
+            "charamel":"caramel",
         }
 
         tokens: List[str] = []
@@ -1124,6 +1457,55 @@ class DialogueManager:
             for tok in self._tokenise_for_matching(candidate_text):
                 vocab.add(tok)
         return vocab
+
+    def _build_option_vocab(self, options: Sequence[MenuOption]) -> set[str]:
+        vocab: set[str] = set()
+        for opt in options:
+            candidate = f"{opt.option_group or ''} {opt.option_value or ''}"
+            for tok in re.findall(r"[a-z0-9]+", candidate.lower()):
+                vocab.add(tok)
+        vocab.update({"milk", "syrup", "shot", "shots", "cream", "whipped", "vanilla", "caramel",
+                      "oat", "soya", "soy", "almond", "coconut", "grande", "tall", "venti"})
+        return vocab
+
+    def _handle_pending_options_item(self, raw: str) -> str:
+        lowered = raw.lower()
+
+        if lowered in {"cancel", "stop", "exit", "nevermind", "never mind"}:
+            self.state.awaiting_item_for_pending_options = False
+            self.state.pending_options_queue.clear()
+            return "Okay — I won’t apply those customisations. Which drink or food would you like?"
+
+        # If they send MORE options while we're still waiting for the item, queue them too
+        if self._looks_like_options_only(raw):
+            self.state.pending_options_queue.append(raw)
+            return "Got it — I’ve noted those customisations too. Which drink or food should I apply them to?"
+
+        item = self._find_menu_item_in_text(raw) or self._find_menu_item_in_text_relaxed(raw)
+        if item is None:
+            return (
+                "I couldn’t find that item in the menu. "
+                "Which drink or food should I apply those customisations to? "
+                "For example: “Latte”, “Mocha”, or “Blueberry Muffin”."
+            )
+
+        # Combine all queued option chunks into one parseable string
+        queued_opts = " + ".join(self.state.pending_options_queue)
+
+        # Optional: also include any option words the user typed together with the item
+        raw_tokens = set(self._tokenise_for_matching(raw))
+        has_option_tokens = any(t in getattr(self, "_option_vocab", set()) for t in raw_tokens)
+        combined_options_text = " + ".join([x for x in [queued_opts, (raw if has_option_tokens else "")] if x])
+
+        self.state.awaiting_item_for_pending_options = False
+        self.state.pending_options_queue.clear()
+
+        log_text = f"{item.name} + {queued_opts}".strip(" +")
+        return self._add_specific_item_to_cart(
+            item=item,
+            options_text=combined_options_text,
+            log_text=log_text,
+        )
 
     def _parse_options_from_text(
             self,
@@ -1196,6 +1578,9 @@ class DialogueManager:
 
             # Sizes: allow for any beverage, regardless of the CSV scope
             if group == "size" and category == "beverage":
+                return True
+
+            if group == "milk" and category == "beverage":
                 return True
 
             scope = (opt.applies_to_scope or "").strip()
@@ -1786,6 +2171,17 @@ class DialogueManager:
             return False
         return any(t in self._menu_vocab for t in tokens)
 
+    def _looks_like_options_only(self, text: str) -> bool:
+        toks = set(self._tokenise_for_matching(text or ""))
+
+        # ignore simple connectors
+        toks -= {"and", "or", "plus"}
+
+        if not toks:
+            return False
+        option_vocab = getattr(self, "_option_vocab", set())
+        return all(t in option_vocab for t in toks)
+
     @staticmethod
     def _base_item_name(name: str) -> str:
         """
@@ -1858,7 +2254,9 @@ class DialogueManager:
 
         # If we only have 1-token overlap but there are extra unknown tokens
         # (e.g. "unicorn latte"), treat as suspicious and refuse to match.
-        unknown_tokens = user_tokens_all - recognised_tokens
+        option_tokens = getattr(self, "_option_vocab", set())
+        unknown_tokens = user_tokens_all - recognised_tokens - option_tokens
+
         if best_overlap == 1 and unknown_tokens:
             return None
 
@@ -1988,6 +2386,19 @@ class DialogueManager:
 
         # 3) Prefer items with minimal "extra" tokens (ignoring brands)
         BRAND_TOKENS = {"starbucks", "costa", "express"}
+
+        if len(recognised_tokens) == 1:
+            target = next(iter(recognised_tokens))
+            exact = []
+            for item, toks in candidates:
+                no_brand = {t for t in toks if t not in BRAND_TOKENS}
+                if no_brand == {target}:
+                    exact.append((item, toks))
+            if exact:
+                candidates = exact
+
+        if len(candidates) == 1:
+            return candidates[0][0]
 
         def extra_token_count(item_tokens: set[str]) -> int:
             no_brand = {t for t in item_tokens if t not in BRAND_TOKENS}

@@ -79,6 +79,8 @@ check allergens for cappuccino,ask_item_allergens
 does this drink have lactose?,ask_item_allergens
 is the flat white safe for nut allergy?,ask_item_allergens
 what is in the smoothie?,ask_item_allergens
+"does blueberry muffin contain milk","ask_item_allergens"
+"does the muffin have dairy","ask_item_allergens"
 "I’m vegan, what can I drink here?",ask_vegan_options
 do you have vegan milk?,ask_vegan_options
 vegan options pls,ask_vegan_options
@@ -163,6 +165,8 @@ latte + muffin,ask_calories
 latte x 2 + blueberry muffin,ask_calories
 misto + cookie,ask_calories
 latte grande + vanilla x 2,ask_calories
+"starbucks misto","ask_calories"
+"costa express latte","ask_calories"
 add a tall Misto with oat milk to my order,add_to_cart
 i want to buy a coffee,add_to_cart
 get me a grande latte,add_to_cart
@@ -183,6 +187,12 @@ add a croissant,add_to_cart
 plus one latte,add_to_cart
 ill have a medium americano,add_to_cart
 add to order,add_to_cart
+add blueberry muffin x 2,add_to_cart
+add 2x blueberry muffin,add_to_cart
+add blueberry muffin twice,add_to_cart
+add latte x 2,add_to_cart
+add 2x latte,add_to_cart
+add latte twice,add_to_cart
 remove the blueberry muffin from my cart,remove_from_cart
 delete that item,remove_from_cart
 take the coffee out,remove_from_cart
@@ -231,6 +241,8 @@ verify order,show_cart
 basket check,show_cart
 do i have the muffin in there?,show_cart
 current order,show_cart
+"show me my cart","show_cart"
+"how cart","show_cart"
 go to checkout,checkout
 i want to pay,checkout
 checkout now,checkout

@@ -39,7 +39,7 @@ def build_dialogue_manager(retrain_intents: bool = False) -> DialogueManager:
         intent_classifier=intent_model,
         faq_engine=faq_engine,
         menu_items=menu_items,
-        menu_options=load_option_items()
+        menu_options=menu_options
     )
     return dm
 

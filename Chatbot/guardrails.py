@@ -26,7 +26,7 @@ ANGRY_WORDS = {
 # More direct insults / abuse aimed at the bot
 ABUSE_KEYWORDS = {
     "stupid", "idiot", "dumb bot", "moron", "loser",
-    "hate you", "shut up", "f off",
+    "hate you", "shut up", "fuck off",
 }
 
 # Complaint-like phrasing
