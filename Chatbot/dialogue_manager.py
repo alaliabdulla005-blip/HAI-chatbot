@@ -22,7 +22,7 @@ import re
 from collections import Counter
 
 from .intents import SklearnIntentClassifier, IntentLabel
-from .state_models import ChatState, CartLine, FlowContext
+from .state_models import ChatState, CartLine, FlowContext, UndoEntry
 from .faq_search import FAQSearchEngine, FAQMatch
 from .domain_models import MenuItem, FAQEntry, MenuOption  # adjust imports if needed
 from . import guardrails
@@ -44,7 +44,7 @@ class ChatbotConfig:
 
 
 # Fallback messages when the bot don't understand
-FALLBACK_MESSAGES = FALLBACK_MESSAGES = [
+FALLBACK_MESSAGES = [
     (
         "I’m not completely sure what you mean. "
         "I can help with café questions like drinks, allergens, calories, vegan/halal options, "
@@ -195,6 +195,9 @@ class DialogueManager:
             return gr_result
 
         # 2) Pending “name” answers override normal intent detection
+        if self._looks_like_undo(raw):
+            return self._handle_undo()
+
         if self.state.awaiting_user_name:
             return self._handle_user_name_reply(raw)
 
@@ -274,6 +277,7 @@ class DialogueManager:
 
         # options guard
         if self._looks_like_options_only(raw):
+            self._push_undo("start customisations")
             self.state.pending_options_queue.append(raw)
             self.state.awaiting_item_for_pending_options = True
             return "Those sound like customisations (milk/syrups/shots). Which drink or food should I apply them to?"
@@ -291,28 +295,8 @@ class DialogueManager:
                 if self._find_menu_item_in_text(raw) or self._find_menu_item_in_text_relaxed(raw):
                     return self._handle_item_allergens(raw)
 
-            # allow cancel
-            if lowered in {"cancel", "stop", "exit", "nevermind", "never mind"}:
-                self.state.awaiting_item_for_pending_options = False
-                self.state.pending_options_text = ""
-                return "Okay — I won’t apply those customisations. Which drink or food would you like?"
-
-            item = self._find_menu_item_in_text(raw) or self._find_menu_item_in_text_relaxed(raw)
-            if item is None:
-                return (
-                    "I couldn’t find that item in the menu. "
-                    "Which drink or food should I apply those customisations to? "
-                    "For example: “Latte”, “Mocha”, or “Blueberry Muffin”."
-                )
-
-            # consume pending options
-            options_text = self.state.pending_options_text
-            self.state.awaiting_item_for_pending_options = False
-            self.state.pending_options_text = ""
-
-            # add using the known item + stored options
-            log_text = f"{item.name} + {options_text}"
-            return self._add_specific_item_to_cart(item=item, options_text=options_text, log_text=log_text)
+        if self._looks_like_show_menu_request(lowered):
+            return self._handle_show_menu(raw)
 
         # 4) Intent detection
         intent_label, confidence = self.intent_classifier.predict_intent(raw)
@@ -356,6 +340,7 @@ class DialogueManager:
             IntentLabel.ADD_TO_CART: self._handle_add_to_cart,
             IntentLabel.REMOVE_FROM_CART: self._handle_remove_from_cart,
             IntentLabel.SHOW_CART: self._handle_show_cart,
+            IntentLabel.SHOW_MENU: self._handle_show_menu,
             IntentLabel.CHECKOUT: self._handle_checkout,
             IntentLabel.CHANGE_USER_NAME: self._handle_change_user_name,
             IntentLabel.CHANGE_BOT_NAME: self._handle_change_bot_name,
@@ -364,6 +349,7 @@ class DialogueManager:
             IntentLabel.USER_ANGRY: self._handle_user_angry,
             IntentLabel.USER_INSULT: self._handle_user_insult,
             IntentLabel.OUT_OF_SCOPE: self._handle_out_of_scope,
+            IntentLabel.UNDO: self._handle_undo,
         }
 
         handler = handler_map.get(intent_label)
@@ -396,22 +382,43 @@ class DialogueManager:
         )
 
     def _handle_capabilities(self, _: str) -> str:
-        """
-        Explain what the café assistant can do and show a small teaser
-        of the menu so UI layers (CLI / Streamlit) have a clean entry point.
-        """
+        bot = self.state.bot_name
+
         lines: List[str] = [
-            "I’m your café assistant. I can:",
-            "- Answer allergen questions, including vegan/halal/gluten-free suitability.",
-            "- Give approximate calorie estimates for drinks, food and simple combinations.",
-            "- Help with your order – adding/removing items, showing your cart and checking out.",
+            f"{bot}: I’m your café assistant. Quick guide:",
+            "",
+            "**Menu**",
+            "- Type `show menu` — show the menu",
+            "- Type `show drink menu` — drinks only",
+            "- Type `show food menu` — food only",
+            "- Type `starbucks menu` / `costa menu` — show a specific brand (if available)",
+            "",
+            "**Allergens & dietary**",
+            "- Ask: `Does \"<item>\" contain milk/nuts/gluten/soy?`",
+            "- Ask: `Is \"<item>\" vegan?` / `halal-friendly?` / `gluten-free?`",
+            "- Ask: `What vegan/halal/gluten-free options do you have?`",
+            "",
+            "**Calories (approx.)**",
+            "- Ask: `How many calories are in \"<item>\"?`",
+            "- Ask: `Calories in a latte with oat milk + vanilla syrup`",
+            "",
+            "**Order / cart**",
+            "- Type `add \"<item name>\"` — add to cart (you can include options like oat milk, extra shot, syrups)",
+            "- Type `remove \"<item name>\"` — remove one from cart",
+            "- Type `show cart` — view cart",
+            "- Type `checkout` — place order",
+            "",
+            "**Customisations**",
+            "- You can type options like `oat milk`, `vanilla syrup x 2`, `extra shot`",
+            "- If you send options alone, I’ll ask which item to apply them to",
+            "",
+            "**Personalisation**",
+            "- Type `my name is <name>` / `call me <name>`",
+            "- Type `from now on call you <name>` (rename the bot)",
+            "",
+            "**Undo**",
+            "- Type `undo` — revert the last action",
         ]
-
-        teaser = self._build_menu_teaser()
-        if teaser:
-            lines.append("")
-            lines.append(teaser)
-
         return "\n".join(lines)
 
     def _handle_change_user_name(self, user_text: str) -> str:
@@ -421,16 +428,19 @@ class DialogueManager:
         """
         name = self._extract_user_name(user_text)
         if name:
+            self._push_undo("change user name")
             self.state.user_name = name
             self.state.awaiting_user_name = False
             return f"Got it, I’ll call you {name} from now on."
 
+        self._push_undo("start user name change")
         self.state.awaiting_user_name = True
         return "Sure – what should I call you?"
 
     def _handle_change_bot_name(self, user_text: str) -> str:
         name = self._extract_bot_name(user_text)
         if name:
+            self._push_undo("change bot name")
             self.state.bot_name = name
             self.state.awaiting_bot_name = False
             return f"Okay, I’ll go by {name} now."
@@ -449,6 +459,7 @@ class DialogueManager:
             return "I didn’t quite catch that – could you give me a short name?"
 
         # Optional polish: normalise stored names to title case
+        self._push_undo("change user name")
         self.state.user_name = name.strip().title()
         self.state.awaiting_user_name = False
         return f"Nice to meet you, {self.state.user_name}!"
@@ -457,6 +468,7 @@ class DialogueManager:
         name = self._extract_bot_name(user_text) or self._clean_name(user_text)
         if not name:
             return "I’m not sure that works as a name – try something shorter?"
+        self._push_undo("change bot name")
         self.state.bot_name = name
         self.state.awaiting_bot_name = False
         return f"Great, I’ll be {name}."
@@ -609,8 +621,13 @@ class DialogueManager:
 
         return self._format_item_allergen_answer(item)
 
-    def _handle_vegan_options(self, _: str) -> str:
-        # Use FAQ if present, otherwise derive from menu.
+    def _handle_vegan_options(self, user_text: str) -> str:
+        # 1) If the user is asking about a specific item, answer that item.
+        item = self._find_menu_item_in_text(user_text) or self._find_menu_item_in_text_relaxed(user_text)
+        if item is not None:
+            return self._format_item_allergen_answer(item)
+
+        # 2) Otherwise, treat it as a general “what vegan options do you have?” question.
         faq = self.faq_engine.get_faq_by_id("menu_vegan_examples")
         if faq:
             return faq.answer_markdown
@@ -903,6 +920,9 @@ class DialogueManager:
             if re.search(r"\bwith\b", text, flags=re.IGNORECASE):
                 item_phrase = re.split(r"\bwith\b", text, maxsplit=1, flags=re.IGNORECASE)[0].strip()
 
+            qty = self._extract_quantity(item_phrase)
+            ctx.data["quantity"] = qty
+
             # Match item NOW and store it so options can't change it later
             item = self._find_menu_item_in_text(item_phrase) or self._find_menu_item_in_text_relaxed(item_phrase)
             if item is None:
@@ -962,6 +982,7 @@ class DialogueManager:
                 item=item,
                 options_text=options_phrase,
                 log_text=user_text,
+                quantity=ctx.data.get("quantity", 1),
             )
 
             return (
@@ -990,6 +1011,8 @@ class DialogueManager:
                 "I’m not sure which item to add. "
                 "Try saying something like “add a tall Misto with oat drink to my order”."
             )
+        quantity = self._extract_item_quantity(user_text, item)
+        self._push_undo(f"add {item.name}")
 
         # Detect options for this item (sizes, milks, syrups, shots, etc.)
         option_pairs = self._parse_options_from_text(user_text, base_item=item)
@@ -1007,14 +1030,14 @@ class DialogueManager:
 
         for line in self.state.cart:
             if same_config(line):
-                line.quantity += 1
+                line.quantity += quantity
                 break
         else:
             self.state.cart.append(
                 CartLine(
                     item_id=item.item_id,
                     item_name=item.name,
-                    quantity=1,
+                    quantity=quantity,
                     selected_options=selected_option_ids,
                 )
             )
@@ -1026,11 +1049,13 @@ class DialogueManager:
             # Logging must never break the chat
             pass
 
+        qty_label = f" × {quantity}" if quantity > 1 else ""
+
         if selected_option_ids:
             options_label = self._format_options_summary(selected_option_ids)
-            base_reply = f"Added {item.name} ({options_label}) to your cart."
+            base_reply = f"Added {item.name}{qty_label} ({options_label}) to your cart."
         else:
-            base_reply = f"Added {item.name} to your cart."
+            base_reply = f"Added {item.name}{qty_label} to your cart."
 
         # Attach any sugar-free fallback explanations
         notes = self._consume_sugar_free_notes()
@@ -1044,6 +1069,7 @@ class DialogueManager:
             item: MenuItem,
             options_text: str,
             log_text: str,
+            quantity: int = 1,
     ) -> str:
         """
         Add a *known* menu item to cart, parsing options only from options_text.
@@ -1064,14 +1090,14 @@ class DialogueManager:
 
         for line in self.state.cart:
             if same_config(line):
-                line.quantity += 1
+                line.quantity += quantity
                 break
         else:
             self.state.cart.append(
                 CartLine(
                     item_id=item.item_id,
                     item_name=item.name,
-                    quantity=1,
+                    quantity=quantity,
                     selected_options=selected_option_ids,
                 )
             )
@@ -1081,11 +1107,12 @@ class DialogueManager:
         except Exception:
             pass
 
+        qty_label = f" × {quantity}" if quantity > 1 else ""
         if selected_option_ids:
             options_label = self._format_options_summary(selected_option_ids)
-            base_reply = f"Added {item.name} ({options_label}) to your cart."
+            base_reply = f"Added {item.name}{qty_label} ({options_label}) to your cart."
         else:
-            base_reply = f"Added {item.name} to your cart."
+            base_reply = f"Added {item.name}{qty_label} to your cart."
 
         notes = self._consume_sugar_free_notes()
         if notes:
@@ -1136,6 +1163,7 @@ class DialogueManager:
 
         # 1) Bulk clear-cart commands: "delete all items", "clear cart", "remove everything", etc.
         if self._is_clear_cart_command(lowered):
+            self._push_undo("clear cart")
             self.state.cart.clear()
             return "Your cart is now empty."
 
@@ -1148,6 +1176,7 @@ class DialogueManager:
             #     unless the user clearly asked to remove *all*.
             if len(self.state.cart) == 1:
                 line = self.state.cart[0]
+                self._push_undo("remove from cart")
 
                 # If they explicitly mentioned "all" / "everything", drop the whole line.
                 if re.search(r"\b(all|everything)\b", lowered):
@@ -1179,6 +1208,14 @@ class DialogueManager:
 
         def same_base(line: CartLine) -> bool:
             return self._base_item_name(line.item_name) == target_base
+
+        will_remove = any(line.item_id == item.item_id for line in self.state.cart)
+        if not will_remove:
+            base_matches = [line for line in self.state.cart if same_base(line)]
+            will_remove = (len(base_matches) == 1)
+
+        if will_remove:
+            self._push_undo("remove from cart")
 
         new_cart: List[CartLine] = []
         removed_any = False
@@ -1291,6 +1328,7 @@ class DialogueManager:
         # For now, we just summarise and clear the cart;
         # later you can compute price, calories, etc.
         summary = self._handle_show_cart("")
+        self._push_undo("checkout")
         self.state.cart.clear()
 
         # Log this successful CHECKOUT intent
@@ -1446,6 +1484,70 @@ class DialogueManager:
                 tokens.append(norm)
         return tokens
 
+    def _extract_quantity(self, text: str) -> int:
+        t = (text or "").lower().strip()
+
+        # common forms: "x 2", "x2", "2x", "2 x", "× 2"
+        m = re.search(r"\b(?:x|×)\s*(\d+)\b", t)
+        if m:
+            return max(1, int(m.group(1)))
+
+        m = re.search(r"\b(\d+)\s*(?:x|×)\b", t)
+        if m:
+            return max(1, int(m.group(1)))
+
+        # "2 times", "times 2"
+        m = re.search(r"\b(\d+)\s*(?:times|time)\b", t)
+        if m:
+            return max(1, int(m.group(1)))
+
+        m = re.search(r"\b(?:times|time)\s*(\d+)\b", t)
+        if m:
+            return max(1, int(m.group(1)))
+
+        # words
+        if re.search(r"\b(twice|double)\b", t):
+            return 2
+        if re.search(r"\b(triple)\b", t):
+            return 3
+
+        return 1
+
+    def _extract_item_quantity(self, user_text: str, item: Optional[MenuItem]) -> int:
+        """
+        Extract quantity for the *base menu item* without accidentally treating
+        option multipliers like 'vanilla syrup x 2' as item quantity.
+        """
+        text = (user_text or "")
+
+        # If the user uses '+', prefer the segment that actually contains the item
+        parts = re.split(r"\s*\+\s*", text)
+        seg = None
+        if item is not None:
+            for p in parts:
+                p_item = self._find_menu_item_in_text_relaxed(p)
+                if p_item and p_item.item_id == item.item_id:
+                    seg = p
+                    break
+
+        seg = seg or (parts[0] if parts else text)
+
+        # Remove option-level multipliers before extracting item quantity
+        cleaned = re.sub(
+            r"\b(?:syrup|shot|shots|topping|toppings|sweetener|sweeteners|pump|pumps)\s*(?:x|×)\s*\d+\b",
+            "",
+            seg,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"\b\d+\s*(?:x|×)\s*(?:syrup|shot|shots|topping|toppings|sweetener|sweeteners|pump|pumps)\b",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+
+        return self._extract_quantity(cleaned)
+
     def _build_menu_vocab(self, items: Sequence[MenuItem]) -> set:
         """
         Build a vocabulary of tokens that appear in any menu item
@@ -1472,39 +1574,43 @@ class DialogueManager:
         lowered = raw.lower()
 
         if lowered in {"cancel", "stop", "exit", "nevermind", "never mind"}:
+            self._push_undo("cancel customisations")
             self.state.awaiting_item_for_pending_options = False
             self.state.pending_options_queue.clear()
             return "Okay — I won’t apply those customisations. Which drink or food would you like?"
 
         # If they send MORE options while we're still waiting for the item, queue them too
+        item = self._find_menu_item_in_text(raw) or self._find_menu_item_in_text_relaxed(raw)
+        if item is not None:
+            quantity = self._extract_item_quantity(raw, item)  # helper you’ll add below
+
+            queued_opts = " + ".join(self.state.pending_options_queue)
+
+            raw_tokens = set(self._tokenise_for_matching(raw))
+            has_option_tokens = any(t in getattr(self, "_option_vocab", set()) for t in raw_tokens)
+            combined_options_text = " + ".join([x for x in [queued_opts, (raw if has_option_tokens else "")] if x])
+
+            self.state.awaiting_item_for_pending_options = False
+            self.state.pending_options_queue.clear()
+
+            log_text = f"{item.name} + {queued_opts}".strip(" +")
+            return self._add_specific_item_to_cart(
+                item=item,
+                options_text=combined_options_text,
+                log_text=log_text,
+                quantity=quantity,
+            )
+
+        # 2) Otherwise: if it’s more options, queue them
         if self._looks_like_options_only(raw):
             self.state.pending_options_queue.append(raw)
             return "Got it — I’ve noted those customisations too. Which drink or food should I apply them to?"
 
-        item = self._find_menu_item_in_text(raw) or self._find_menu_item_in_text_relaxed(raw)
-        if item is None:
-            return (
-                "I couldn’t find that item in the menu. "
-                "Which drink or food should I apply those customisations to? "
-                "For example: “Latte”, “Mocha”, or “Blueberry Muffin”."
-            )
-
-        # Combine all queued option chunks into one parseable string
-        queued_opts = " + ".join(self.state.pending_options_queue)
-
-        # Optional: also include any option words the user typed together with the item
-        raw_tokens = set(self._tokenise_for_matching(raw))
-        has_option_tokens = any(t in getattr(self, "_option_vocab", set()) for t in raw_tokens)
-        combined_options_text = " + ".join([x for x in [queued_opts, (raw if has_option_tokens else "")] if x])
-
-        self.state.awaiting_item_for_pending_options = False
-        self.state.pending_options_queue.clear()
-
-        log_text = f"{item.name} + {queued_opts}".strip(" +")
-        return self._add_specific_item_to_cart(
-            item=item,
-            options_text=combined_options_text,
-            log_text=log_text,
+        # 3) Otherwise: unknown
+        return (
+            "I couldn’t find that item in the menu. "
+            "Which drink or food should I apply those customisations to? "
+            "For example: “Latte”, “Mocha”, or “Blueberry Muffin”."
         )
 
     def _parse_options_from_text(
@@ -2174,11 +2280,21 @@ class DialogueManager:
     def _looks_like_options_only(self, text: str) -> bool:
         toks = set(self._tokenise_for_matching(text or ""))
 
-        # ignore simple connectors
+        # ignore connectors
         toks -= {"and", "or", "plus"}
+
+        # ignore quantity markers and numbers
+        qty_noise = {"x", "times", "time", "double", "triple", "twice"}
+        toks = {t for t in toks if (t not in qty_noise and not t.isdigit())}
 
         if not toks:
             return False
+
+        # If it's a single token, only treat it as options-only if it's a strong milk-variant cue.
+        # This prevents things like "mocha" being treated as a syrup option when the user likely means the drink.
+        if len(toks) == 1:
+            return next(iter(toks)) in {"oat", "almond", "soya", "soy", "coconut"}
+
         option_vocab = getattr(self, "_option_vocab", set())
         return all(t in option_vocab for t in toks)
 
@@ -2314,6 +2430,138 @@ class DialogueManager:
 
         # Reuse the existing tie-breaking heuristics
         return self._break_tie(user_tokens_all, recognised_tokens, candidates)
+
+    def _looks_like_show_menu_request(self, lowered: str) -> bool:
+        t = (lowered or "").strip()
+        if not t:
+            return False
+
+        # Very direct requests
+        if t in {
+            "menu", "show menu", "show me the menu", "view menu", "list menu",
+            "drink menu", "drinks menu", "food menu",
+            "starbucks menu", "costa menu", "costa express menu",
+        }:
+            return True
+
+        # Common phrasings
+        patterns = [
+            r"\b(show|see|view|display|list)\b.*\bmenu\b",
+            r"\bwhat('s| is)\b.*\bon\b.*\bmenu\b",
+            r"\bwhat do you have\b",
+            r"\bwhat drinks do you have\b",
+            r"\bwhat food do you have\b",
+            r"\b(starbucks|costa)\b.*\bmenu\b",
+        ]
+        return any(re.search(p, t) for p in patterns)
+
+    def _handle_show_menu(self, user_text: str) -> str:
+        lowered = (user_text or "").lower()
+
+        # ---- filters (lightweight, no extra intents needed) ----
+        category = None
+        if any(w in lowered for w in ["drink", "drinks", "coffee", "beverage"]):
+            category = "beverage"
+        if any(w in lowered for w in ["food", "snack", "snacks", "pastry", "sandwich"]):
+            category = "food"
+
+        vegan_only = "vegan" in lowered
+        vegetarian_only = ("vegetarian" in lowered) and not vegan_only
+        halal_only = "halal" in lowered
+        gluten_free_only = ("gluten free" in lowered) or ("gluten-free" in lowered)
+
+        show_all = bool(re.search(r"\b(all|full|everything|complete)\b", lowered))
+
+        # ---- get active items ----
+        items = [m for m in self.menu_items if getattr(m, "is_active", True)]
+        if category:
+            items = [m for m in items if (getattr(m, "category", "") or "").lower() == category]
+
+        if vegan_only:
+            items = [m for m in items if bool(getattr(m, "suitable_vegan", False))]
+        elif vegetarian_only:
+            items = [m for m in items if bool(getattr(m, "suitable_vegetarian", False))]
+
+        if halal_only:
+            # use your existing halal classifier
+            items = [m for m in items if
+                     self._get_halal_flags(m).get("halal_friendly") or self._get_halal_flags(m).get("vegan_hint")]
+
+        if gluten_free_only:
+            # best-effort: treat any of these as gluten signals if present in your CSV
+            GLUTEN_KEYS = {"contains_gluten", "contains_wheat", "contains_barley", "contains_rye", "contains_oats"}
+
+            def looks_gf(mi: MenuItem) -> bool:
+                allergens = getattr(mi, "allergens", {}) or {}
+                return not any(allergens.get(k, False) for k in GLUTEN_KEYS)
+
+            items = [m for m in items if looks_gf(m)]
+
+        if not items:
+            return "I couldn’t find any matching items on the menu with those filters."
+
+        brand = None
+        if "starbucks" in lowered:
+            brand = "starbucks"
+        elif "costa" in lowered:
+            brand = "costa"
+
+        if brand:
+            items = [
+                m for m in items
+                if brand in (getattr(m, "brand", "") or "").lower()
+            ]
+
+        # ---- group & format ----
+        items = sorted(items, key=lambda m: ((getattr(m, "category", "") or ""), (getattr(m, "name", "") or "")))
+
+        MAX_TOTAL = 25
+        shown = items if show_all else items[:MAX_TOTAL]
+        remaining = max(0, len(items) - len(shown))
+
+        # group by category for readability
+        by_cat = {}
+        for it in shown:
+            cat = (getattr(it, "category", None) or "Other").strip() or "Other"
+            by_cat.setdefault(cat, []).append(it)
+
+        lines = ["Here’s the menu I have in my data right now:"]
+        for cat in sorted(by_cat.keys()):
+            lines.append(f"\n**{cat}**")
+            for it in by_cat[cat]:
+                name = it.name
+                price = getattr(it, "base_price_gbp", 0.0) or 0.0
+                kcal = getattr(it, "calories_kcal", 0.0) or 0.0
+
+                meta = []
+                if price > 0:
+                    meta.append(f"£{price:.2f}")
+                if kcal > 0:
+                    meta.append(f"{kcal:.0f} kcal")
+
+                tag_bits = []
+                if getattr(it, "suitable_vegan", False):
+                    tag_bits.append("vegan")
+                elif getattr(it, "suitable_vegetarian", False):
+                    tag_bits.append("vegetarian")
+                if any("halal" in (t.lower()) for t in (getattr(it, "diet_tags", []) or [])):
+                    tag_bits.append("halal-friendly")
+
+                suffix = ""
+                if tag_bits:
+                    suffix = " [" + ", ".join(tag_bits) + "]"
+
+                if meta:
+                    lines.append(f"- {name} — {' — '.join(meta)}{suffix}")
+                else:
+                    lines.append(f"- {name}{suffix}")
+
+        if remaining > 0:
+            lines.append(f"\n(Showing the first {len(shown)} items. Say **“show full menu”** to list everything.)")
+
+        lines.append(
+            "\nYou can also say things like: “show drink menu”, “show vegan menu”, or “add a latte with oat milk to my order”.")
+        return "\n".join(lines)
 
     def _consume_sugar_free_notes(self) -> List[str]:
         """
@@ -2556,6 +2804,46 @@ class DialogueManager:
             "has_pork": has_pork,
             "has_alcohol": has_alcohol,
         }
+
+    def _looks_like_undo(self, raw: str) -> bool:
+        t = raw.strip().lower()
+        return t in {"undo", "undo last action", "undo that", "go back", "back", "revert"} or t.startswith("undo ")
+
+    def _push_undo(self, label: str = "last action") -> None:
+        # don’t push empty/no-op states too aggressively; keep it simple
+        snap = self.state.make_snapshot()
+        self.state.undo_stack.append(UndoEntry(snapshot=snap, label=label))
+        # cap history
+        MAX_UNDO = 25
+        if len(self.state.undo_stack) > MAX_UNDO:
+            self.state.undo_stack.pop(0)
+
+    def _handle_undo(self) -> str:
+        if not self.state.undo_stack:
+            return "Nothing to undo."
+
+        before_user = self.state.user_name
+        before_bot = self.state.bot_name
+        before_cart = list(self.state.cart)
+        before_pending = (self.state.awaiting_item_for_pending_options, list(self.state.pending_options_queue))
+
+        entry = self.state.undo_stack.pop()
+        self.state.restore_snapshot(entry.snapshot)
+
+        changes = []
+        if self.state.user_name != before_user:
+            changes.append(f"user name → {self.state.user_name}")
+        if self.state.bot_name != before_bot:
+            changes.append(f"bot name → {self.state.bot_name}")
+        if list(self.state.cart) != before_cart:
+            changes.append("cart reverted")
+        if (self.state.awaiting_item_for_pending_options, list(self.state.pending_options_queue)) != before_pending:
+            changes.append("customisations step reverted")
+
+        if changes:
+            return "Undone — " + ", ".join(changes) + "."
+        return "Undone."
+
 
 
 

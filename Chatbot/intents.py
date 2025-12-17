@@ -43,6 +43,7 @@ class IntentLabel(str, Enum):
     ADD_TO_CART = "add_to_cart"
     REMOVE_FROM_CART = "remove_from_cart"
     SHOW_CART = "show_cart"
+    SHOW_MENU = "show_menu"
     CHECKOUT = "checkout"
     CHANGE_USER_NAME = "change_user_name"
     CHANGE_BOT_NAME = "change_bot_name"
@@ -51,6 +52,7 @@ class IntentLabel(str, Enum):
     USER_ANGRY = "user_angry"
     USER_INSULT = "user_insult"
     OUT_OF_SCOPE = "out_of_scope"
+    UNDO = "undo"
 
 INTENT_STR_TO_LABEL: Dict[str, IntentLabel] = {
     label.value: label for label in IntentLabel

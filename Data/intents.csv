@@ -193,6 +193,14 @@ add blueberry muffin twice,add_to_cart
 add latte x 2,add_to_cart
 add 2x latte,add_to_cart
 add latte twice,add_to_cart
+mocha,add_to_cart
+latte,add_to_cart
+cappuccino,add_to_cart
+americano,add_to_cart
+espresso,add_to_cart
+hot chocolate,add_to_cart
+flat white,add_to_cart
+cortado,add_to_cart
 remove the blueberry muffin from my cart,remove_from_cart
 delete that item,remove_from_cart
 take the coffee out,remove_from_cart
@@ -241,8 +249,20 @@ verify order,show_cart
 basket check,show_cart
 do i have the muffin in there?,show_cart
 current order,show_cart
-"show me my cart","show_cart"
-"how cart","show_cart"
+show me my cart,show_cart
+show menu,show_menu
+menu,show_menu
+show me the menu,show_menu
+what's on the menu,show_menu
+list the menu,show_menu
+show drink menu,show_menu
+show food menu,show_menu
+show vegan menu,show_menu
+show vegetarian menu,show_menu
+show halal menu,show_menu
+show gluten free menu,show_menu
+what drinks do you have,show_menu
+what food do you have,show_menu
 go to checkout,checkout
 i want to pay,checkout
 checkout now,checkout
@@ -407,3 +427,8 @@ speak to a manager,user_complaint
 report a bug,user_complaint
 bad experience,user_complaint
 file a grievance,user_complaint
+undo,undo
+undo last action,undo
+undo that,undo
+go back,undo
+revert that,undo
