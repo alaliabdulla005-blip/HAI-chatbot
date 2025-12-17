@@ -23,6 +23,7 @@ class ConversationState:
     awaiting_bot_name: bool = False
     anger_count: int = 0
     abuse_count: int = 0
+    dietary_flags: set[str] = field(default_factory=set)
 
 @dataclass
 class FlowContext:
@@ -53,6 +54,7 @@ class ChatStateSnapshot:
     active_flow: Optional["FlowContext"]
     awaiting_item_for_pending_options: bool
     pending_options_queue: Deque[str]
+    dietary_flags: set[str] = field(default_factory=set)
 
 @dataclass
 class ChatState(ConversationState):
@@ -79,6 +81,7 @@ class ChatState(ConversationState):
             active_flow=deepcopy(self.active_flow),
             awaiting_item_for_pending_options=self.awaiting_item_for_pending_options,
             pending_options_queue=deque(self.pending_options_queue),
+            dietary_flags=set(self.dietary_flags),
         )
 
     def restore_snapshot(self, snap: ChatStateSnapshot) -> None:
@@ -91,3 +94,4 @@ class ChatState(ConversationState):
         self.active_flow = deepcopy(snap.active_flow)
         self.awaiting_item_for_pending_options = snap.awaiting_item_for_pending_options
         self.pending_options_queue = deque(snap.pending_options_queue)
+        self.dietary_flags = set(getattr(snap, "dietary_flags", []))

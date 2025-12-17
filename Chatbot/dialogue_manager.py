@@ -229,12 +229,18 @@ class DialogueManager:
         if "what is my name" in lowered or "what's my name" in lowered or "whats my name" in lowered:
             return f"Right now, I know you as {self.state.user_name}."
 
-        # Heuristic: user wants to change THEIR own name
+        # Heuristics: User stating dietary needs, change his name, and change bot name
+        # e.g. "I am vegan", "I'm vegetarian", "I eat halal"
+        diet_match = self._extract_dietary_statement(lowered)
+        if diet_match:
+            self._push_undo("set dietary preference")
+            self.state.dietary_flags.add(diet_match)
+            return f"Noted. I'll remember that you are **{diet_match}** for this order."
+
         # e.g. "my name is Ali", "call me Ali"
         if re.search(r"\bmy name is\b", lowered) or re.search(r"\bcall me\b", lowered):
             return self._handle_change_user_name(raw)
 
-        # Heuristic: user wants to change the BOT name
         # e.g. "I'll call you Jarvis", "change your name to Jarvis", "im calling you Steve"
         if any(
                 phrase in lowered
@@ -387,36 +393,36 @@ class DialogueManager:
         lines: List[str] = [
             f"{bot}: I’m your café assistant. Quick guide:",
             "",
-            "**Menu**",
+            "Menu",
             "- Type `show menu` — show the menu",
             "- Type `show drink menu` — drinks only",
             "- Type `show food menu` — food only",
             "- Type `starbucks menu` / `costa menu` — show a specific brand (if available)",
             "",
-            "**Allergens & dietary**",
+            "Allergens & dietary",
             "- Ask: `Does \"<item>\" contain milk/nuts/gluten/soy?`",
             "- Ask: `Is \"<item>\" vegan?` / `halal-friendly?` / `gluten-free?`",
             "- Ask: `What vegan/halal/gluten-free options do you have?`",
             "",
-            "**Calories (approx.)**",
+            "Calories (approx.)",
             "- Ask: `How many calories are in \"<item>\"?`",
             "- Ask: `Calories in a latte with oat milk + vanilla syrup`",
             "",
-            "**Order / cart**",
+            "Order / cart",
             "- Type `add \"<item name>\"` — add to cart (you can include options like oat milk, extra shot, syrups)",
             "- Type `remove \"<item name>\"` — remove one from cart",
             "- Type `show cart` — view cart",
             "- Type `checkout` — place order",
             "",
-            "**Customisations**",
+            "Customisations",
             "- You can type options like `oat milk`, `vanilla syrup x 2`, `extra shot`",
             "- If you send options alone, I’ll ask which item to apply them to",
             "",
-            "**Personalisation**",
+            "Personalisation",
             "- Type `my name is <name>` / `call me <name>`",
             "- Type `from now on call you <name>` (rename the bot)",
             "",
-            "**Undo**",
+            "Undo",
             "- Type `undo` — revert the last action",
         ]
         return "\n".join(lines)
@@ -472,6 +478,19 @@ class DialogueManager:
         self.state.bot_name = name
         self.state.awaiting_bot_name = False
         return f"Great, I’ll be {name}."
+
+    def _extract_dietary_statement(self, text: str) -> Optional[str]:
+        """Detect explicit statements like 'I am vegan'."""
+        t = text.lower()
+        if "vegan" in t and ("i am" in t or "im" in t or "i'm" in t):
+            return "vegan"
+        if "vegetarian" in t and ("i am" in t or "im" in t or "i'm" in t):
+            return "vegetarian"
+        if "halal" in t and ("eat" in t or "only" in t or "i am" in t):
+            return "halal"
+        if "gluten" in t and ("free" in t or "allergy" in t or "celiac" in t or "coeliac" in t):
+            return "gluten_free"
+        return None
 
 
     def _extract_user_name(self, text: str) -> Optional[str]:
@@ -645,23 +664,26 @@ class DialogueManager:
     def _handle_halal_options(self, user_text: str) -> str:
         """
         Handle both general and item-specific halal questions.
-
-        - If we can confidently match a specific menu item, delegate to _answer_item_halal.
-        - Otherwise, give a friendly overview of halal-friendly, vegan and clearly non-halal items.
+        Refactored for readability and better item matching.
         """
-        # 1) Item-specific question?
+        # 1) Try strict item match
         item = self._find_menu_item_in_text(user_text)
+
+        # 2) If strict failed, try relaxed match (e.g. "is americano halal" -> "Americano (black)")
+        if item is None:
+            item = self._find_menu_item_in_text_relaxed(user_text)
+
+        # 3) If we found an item, give the specific answer
         if item is not None:
             return self._answer_item_halal(item)
 
-        # 2) General overview from the menu
+        # 4) General overview (Cleaned up for readability)
         halal_examples: List[str] = []
         vegan_examples: List[str] = []
         non_halal_examples: List[str] = []
 
         for m in self.menu_items:
             flags = self._get_halal_flags(m)
-
             if flags["halal_friendly"]:
                 halal_examples.append(m.name)
             elif flags["vegan_hint"]:
@@ -669,54 +691,24 @@ class DialogueManager:
             elif flags["non_halal"]:
                 non_halal_examples.append(m.name)
 
-        def _short_list(names: List[str], limit: int) -> str:
-            unique = sorted(set(names))
-            if not unique:
-                return ""
-            if len(unique) <= limit:
-                return ", ".join(unique)
-            return ", ".join(unique[:limit]) + " and others"
+        def _teaser(names: List[str]) -> str:
+            # Show max 2 examples to reduce noise
+            return ", ".join(sorted(set(names))[:2]) + ("..." if len(names) > 2 else "")
 
-        halal_text = _short_list(halal_examples, 3)
-        vegan_text = _short_list(vegan_examples, 4)
-        non_halal_text = _short_list(non_halal_examples, 3)
+        lines = ["Halal Status Guide (Data-based guidance, not a religious ruling):"]
 
-        parts: List[str] = []
+        if halal_examples:
+            lines.append(f"✅ Halal-friendly: Items like {_teaser(halal_examples)}.")
 
-        parts.append(
-            "From a halal point of view, here’s how our menu looks based on the "
-            "ingredient and allergen information we have (this is guidance, not a religious ruling):"
-        )
+        if vegan_examples:
+            lines.append(f"🌿 Vegan (No Meat/Dairy): Items like {_teaser(vegan_examples)}.")
 
-        if halal_text:
-            parts.append(
-                f"- **Halal-friendly by our tags** (no pork or alcohol listed in our data): "
-                f"for example {halal_text}."
-            )
+        if non_halal_examples:
+            lines.append(f"❌ Not Halal: Items containing pork/alcohol, e.g. {_teaser(non_halal_examples)}.")
 
-        if vegan_text:
-            parts.append(
-                f"- **Vegan by ingredients** (no meat or dairy – many halal-conscious customers "
-                f"choose these): for example {vegan_text}."
-            )
+        lines.append("\nTip: Ask about a specific item, e.g. *“Is the Ham & Cheese Croissant halal?”*")
 
-        if non_halal_text:
-            parts.append(
-                f"- **Clearly not suitable for a halal diet** (contains pork or similar ingredients): "
-                f"for example {non_halal_text}."
-            )
-
-        parts.append(
-            "If you tell me a specific drink or food name (like “Signature Grilled Cheese Toastie” "
-            "or “Americano black”), I can check its ingredients and halal-friendliness for you."
-        )
-
-        parts.append(
-            "For strict halal decisions, please always rely on the latest official allergen/nutrition "
-            "guides, packaging, staff advice, or a trusted scholar – I’m only summarising what’s in our CSV."
-        )
-
-        return "\n".join(parts)
+        return "\n".join(lines)
 
     def _handle_gluten_free(self, user_text: str) -> str:
         """
@@ -832,7 +824,7 @@ class DialogueManager:
 
         return (
             "Let’s build your order step by step.\n\n"
-            "First, are you looking for a **drink** or a **food** item?"
+            "First, are you looking for a drink or a food item?"
         )
 
     def _route_active_flow(self, user_text: str) -> str:
@@ -880,7 +872,7 @@ class DialogueManager:
                 ctx.data["category"] = "food"
             else:
                 return (
-                    "Please say whether you want a **drink** or a **food** item, "
+                    "Please say whether you want a drink or a food item, "
                     "for example “a drink” or “a food snack”."
                 )
 
@@ -937,7 +929,7 @@ class DialogueManager:
             item_cat = (getattr(item, "category", "") or "").lower()
             if chosen_cat and item_cat and chosen_cat != item_cat:
                 return (
-                    f"That sounds like a **{item_cat}**, but you said you want **{chosen_cat}**. "
+                    f"That sounds like a {item_cat}, but you said you want {chosen_cat}. "
                     "Could you give me the exact name of the item in the category you want?"
                 )
 
@@ -946,18 +938,7 @@ class DialogueManager:
 
             ctx.stage = "ask_options"
 
-            category = ctx.data.get("category")
-            if category == "food":
-                return (
-                    "Got it. Do you want any extras?\n"
-                    "If you’re not sure, say “no extras”. (Food extras are limited in my data.)"
-                )
-
-            return (
-                "Got it. Do you want any extras like **oat milk**, **vanilla syrup**, "
-                "**extra espresso shot**, or toppings?\n"
-                "You can say “no extras” if you don’t want anything added."
-            )
+            return self._generate_options_prompt(item)
 
         # -------- Stage 3: ask_options --------
         if ctx.stage == "ask_options":
@@ -1057,12 +1038,41 @@ class DialogueManager:
         else:
             base_reply = f"Added {item.name}{qty_label} to your cart."
 
-        # Attach any sugar-free fallback explanations
+            # Attach any sugar-free fallback explanations
         notes = self._consume_sugar_free_notes()
-        if notes:
-            return base_reply + "\n\n" + "\n".join(notes)
 
-        return base_reply
+        # --- PERSONALISATION CHECK ---
+        warnings = []
+        if "vegan" in self.state.dietary_flags:
+            # 1. Check if user added a plant milk
+            has_plant_milk = any(
+                opt.option_group == "milk" and opt.option_value in {"oat", "almond", "soya", "coconut"}
+                for opt, qty in option_pairs
+            )
+
+            # 2. If item contains milk (and no plant milk selected), warn
+            if getattr(item, "contains_milk", False) and not has_plant_milk:
+                warnings.append(
+                    f"⚠️ **Note:** You flagged yourself as **vegan**, but the **{item.name}** contains dairy by default. "
+                    "You might want to add oat, almond, or soya milk."
+                )
+
+            # 3. If item is simply not suitable for vegans (and not just because of milk)
+            if not getattr(item, "suitable_vegan", False) and not getattr(item, "contains_milk", False):
+                warnings.append(
+                    f"⚠️ **Warning:** The **{item.name}** is not marked as vegan in our menu."
+                )
+
+        # Combine everything
+        final_response = base_reply
+
+        if notes:
+            final_response += "\n\n" + "\n".join(notes)
+
+        if warnings:
+            final_response += "\n\n" + "\n".join(warnings)
+
+        return final_response
 
     def _add_specific_item_to_cart(
             self,
@@ -1301,18 +1311,18 @@ class DialogueManager:
         if total_price > 0 and total_kcal > 0:
             return (
                 f"Here’s what’s in your cart:\n{cart_text}\n\n"
-                f"Estimated total: **£{total_price:.2f}** and "
-                f"**~{total_kcal:.0f} kcal** for your whole cart."
+                f"Estimated total: £{total_price:.2f} and "
+                f"~{total_kcal:.0f} kcal for your whole cart."
             )
         elif total_price > 0:
             return (
                 f"Here’s what’s in your cart:\n{cart_text}\n\n"
-                f"Estimated total: **£{total_price:.2f}** for your whole cart."
+                f"Estimated total: £{total_price:.2f} for your whole cart."
             )
         elif total_kcal > 0:
             return (
                 f"Here’s what’s in your cart:\n{cart_text}\n\n"
-                f"Estimated total: **~{total_kcal:.0f} kcal** for your whole cart."
+                f"Estimated total: ~{total_kcal:.0f} kcal for your whole cart."
             )
 
         return f"Here’s what’s in your cart:\n{cart_text}"
@@ -1698,10 +1708,13 @@ class DialogueManager:
                 if not clause:
                     continue
                 if clause.startswith("item_id:"):
-                    if item_id == clause[len("item_id:"):]:
+                    # Handle whitespace safely
+                    if item_id == clause[len("item_id:"):].strip():
                         return True
                 elif clause.startswith("category:"):
-                    if category == clause[len("category:"):].lower():
+                    # Use "in" for partial matches (e.g. "beverage" matches "hot beverages")
+                    target_cat = clause[len("category:"):].lower().strip()
+                    if target_cat in category:
                         return True
 
             return False
@@ -1744,7 +1757,15 @@ class DialogueManager:
                 if not applies_to_item(opt):
                     continue
 
-                group = (opt.option_group or "").lower()
+                raw_group = (opt.option_group or "").lower().strip()
+                # Normalize plural group names so the parser buckets them correctly
+                if raw_group == "toppings":
+                    group = "topping"
+                elif raw_group == "syrups":
+                    group = "syrup"
+                else:
+                    group = raw_group
+
                 value = (opt.option_value or "").lower()
 
                 # Normalise the option value to tokens
@@ -1814,7 +1835,7 @@ class DialogueManager:
                         label = self._format_option_label(opt_obj, 1)
                         note = (
                             "You asked for a sugar-free syrup, but I don’t have a sugar-free "
-                            f"version of **{label}** for this drink, so I’ve added the regular syrup instead."
+                            f"version of {label} for this drink, so I’ve added the regular syrup instead."
                         )
                     except Exception:
                         note = (
@@ -2069,7 +2090,7 @@ class DialogueManager:
             faq = self.faq_engine.get_faq_by_id("calorie_math")
             extra = "\n\n" + faq.answer_markdown if faq else ""
             return (
-                    f"I couldn’t find calorie data for **{label}** in my menu yet."
+                    f"I couldn’t find calorie data for {label} in my menu yet."
                     + extra
             )
 
@@ -2079,12 +2100,12 @@ class DialogueManager:
 
         if selected_option_ids:
             main = (
-                f"Based on our menu data, **{label}** has about **{kcal:.0f} kcal** "
+                f"Based on our menu data, {label} has about {kcal:.0f} kcal "
                 f"for this configuration."
             )
         else:
             main = (
-                f"Based on our menu data, **{label}** has about **{kcal:.0f} kcal** "
+                f"Based on our menu data, {label} has about {kcal:.0f} kcal "
                 "per serving before any extra syrups, toppings or size changes."
             )
 
@@ -2259,7 +2280,7 @@ class DialogueManager:
         # Final total summary
         lines.append("")
         lines.append(
-            f"Estimated total for everything you described: **~{total_kcal:.0f} kcal**."
+            f"Estimated total for everything you described: ~{total_kcal:.0f} kcal."
         )
         lines.append("")
         lines.append(CALORIE_DISCLAIMER)
@@ -2297,6 +2318,102 @@ class DialogueManager:
 
         option_vocab = getattr(self, "_option_vocab", set())
         return all(t in option_vocab for t in toks)
+
+    def _get_valid_options_for_item(self, item: MenuItem) -> List[MenuOption]:
+        """
+        Returns all options from options.csv that apply to the specific item.
+        Fixes: Handles "toppings" vs "topping", whitespace, and partial category matches.
+        """
+        valid = []
+        item_id = str(getattr(item, "item_id", ""))
+        # Normalize item category: lowercase and strip whitespace
+        item_cat = (getattr(item, "category", "") or "").lower().strip()
+
+        for opt in self.menu_options:
+            scope = (opt.applies_to_scope or "").strip()
+            # Normalize group: lowercase, strip, and singularize "toppings"
+            group = (opt.option_group or "").lower().strip()
+            if group == "toppings":
+                group = "topping"
+
+            # Global/Category defaults
+            if group == "size" and "beverage" in item_cat:
+                valid.append(opt)
+                continue
+            if group == "milk" and "beverage" in item_cat:
+                valid.append(opt)
+                continue
+
+            # Global options (no scope defined)
+            if not scope:
+                valid.append(opt)
+                continue
+
+            # Scope parsing
+            applies = False
+            for clause in scope.split("|"):
+                clause = clause.strip()
+                if clause.startswith("item_id:"):
+                    # FIX: Add .strip() here
+                    if item_id == clause[len("item_id:"):].strip():
+                        applies = True
+                        break
+                elif clause.startswith("category:"):
+                    # Robust check: e.g. "beverage" matches "hot beverages"
+                    target_cat = clause[len("category:"):].lower().strip()
+                    if target_cat in item_cat:
+                        applies = True
+                        break
+
+            if applies:
+                valid.append(opt)
+
+        return valid
+
+    def _generate_options_prompt(self, item: MenuItem) -> str:
+        """
+        Dynamically builds the 'Ask Options' string.
+        Fixes: Checks for plural 'toppings' group key so the prompt appears.
+        """
+        valid_opts = self._get_valid_options_for_item(item)
+
+        groups = {}
+        for opt in valid_opts:
+            # Normalize group to ensure we catch 'toppings' as 'topping'
+            g = (opt.option_group or "other").lower().strip()
+            if g == "toppings":
+                g = "topping"
+            groups.setdefault(g, []).append(opt.option_value)
+
+        # 1. Food Path
+        if "food" in (getattr(item, "category", "") or "").lower():
+            if "options" in groups or "topping" in groups:
+                # Merge options and toppings for food
+                all_food_opts = groups.get("options", []) + groups.get("topping", [])
+                examples = sorted(list(set(all_food_opts)))[:3]
+                # Clean up underscores for display
+                ex_str = ", ".join([e.replace("_", " ") for e in examples])
+                return f"Got it. Any extras or changes? (e.g. {ex_str})."
+            return "Got it. Do you want any extras? (Say “no extras” if not)."
+
+        # 2. Beverage Path
+        parts = []
+        if "milk" in groups:
+            parts.append("oat/almond/soya milk")
+        if "syrup" in groups:
+            parts.append("vanilla/caramel syrup")
+        if "topping" in groups:
+            top_examples = [t.replace("_", " ") for t in sorted(list(set(groups["topping"])))[:2]]
+            parts.append(f"toppings like {' or '.join(top_examples)}")
+
+        if not parts and valid_opts:
+            parts.append("extras")
+
+        prompt_list = ", ".join(parts)
+        return (
+            f"Got it. Do you want to add {prompt_list}?\n"
+            "You can say “no extras” if you don’t want anything added."
+        )
 
     @staticmethod
     def _base_item_name(name: str) -> str:
@@ -2527,7 +2644,7 @@ class DialogueManager:
 
         lines = ["Here’s the menu I have in my data right now:"]
         for cat in sorted(by_cat.keys()):
-            lines.append(f"\n**{cat}**")
+            lines.append(f"\n{cat}")
             for it in by_cat[cat]:
                 name = it.name
                 price = getattr(it, "base_price_gbp", 0.0) or 0.0
@@ -2557,7 +2674,7 @@ class DialogueManager:
                     lines.append(f"- {name}{suffix}")
 
         if remaining > 0:
-            lines.append(f"\n(Showing the first {len(shown)} items. Say **“show full menu”** to list everything.)")
+            lines.append(f"\n(Showing the first {len(shown)} items. Say “show full menu” to list everything.)")
 
         lines.append(
             "\nYou can also say things like: “show drink menu”, “show vegan menu”, or “add a latte with oat milk to my order”.")
@@ -2579,60 +2696,70 @@ class DialogueManager:
         self._sugar_free_notes = []
         return notes
 
-
     def _break_tie(
-        self,
-        user_tokens_all: set[str],
-        recognised_tokens: set[str],
-        candidates: List[tuple[MenuItem, set[str]]],
+            self,
+            user_tokens_all: set[str],
+            recognised_tokens: set[str],
+            candidates: List[tuple[MenuItem, set[str]]],
     ) -> Optional[MenuItem]:
         """
         Tie-breaking heuristics for menu-item matching.
-
-        Order of preference:
-        1) If user mentions a specific variant (oat / almond / soya / coconut),
-           prefer items whose name includes that token.
-        2) If user mentions milk/dairy/lactose and there is a mix of dairy vs
-           non-dairy variants, prefer the dairy build (contains_milk=True).
-        3) Prefer the item whose tokens introduce the fewest extra non-brand
-           tokens beyond what the user said.
-        4) Fall back to the first candidate (stable).
         """
         if not candidates:
             return None
         if len(candidates) == 1:
             return candidates[0][0]
 
-        # 1) Variant keywords (plant milks) – oat / almond / soya / coconut
+        # 0) Variant / Option Tokens (tokens that usually imply an option, not the drink itself)
+        # We want to AVOID matching solely on these if a "real" name token matches instead.
+        OPTION_LIKE_TOKENS = {"almond", "oat", "soya", "soy", "coconut", "milk", "dairy"}
+
+        # Filter candidates: Prefer those that match a token NOT in OPTION_LIKE_TOKENS
+        # e.g. "Latte" (matches 'latte') > "Misto - oat" (matches 'oat')
+        strong_candidates = []
+        for item, item_toks in candidates:
+            # Check which user tokens matched this item
+            matched = item_toks & recognised_tokens
+            # If any matched token is a "core" name (not an option word), this is a strong match
+            if any(t not in OPTION_LIKE_TOKENS for t in matched):
+                strong_candidates.append((item, item_toks))
+
+        if strong_candidates:
+            candidates = strong_candidates
+
+        if len(candidates) == 1:
+            return candidates[0][0]
+
+        # 1) Now, if we still have a tie (e.g. "oat misto" vs "soy misto" for input "oat misto"),
+        # PREFER the one that matches the specific variant mentioned.
         VARIANT_TOKENS = {"almond", "oat", "soya", "soy", "coconut"}
         mentioned_variants = VARIANT_TOKENS & user_tokens_all
 
         if mentioned_variants:
-            filtered: List[tuple[MenuItem, set[str]]] = []
-            for item, toks in candidates:
-                if toks & mentioned_variants:
-                    filtered.append((item, toks))
+            filtered = [
+                (item, toks) for item, toks in candidates
+                if toks & mentioned_variants
+            ]
             if filtered:
                 candidates = filtered
 
         if len(candidates) == 1:
             return candidates[0][0]
 
-        # 2) Milk words – only apply *after* variant matching
+        # 2) Milk words preference (existing logic)
         MILK_WORDS = {"milk", "dairy", "lactose"}
         if user_tokens_all & MILK_WORDS:
-            dairy_candidates: List[tuple[MenuItem, set[str]]] = []
-            for item, toks in candidates:
-                allergens = getattr(item, "allergens", {}) or {}
-                if allergens.get("contains_milk", False):
-                    dairy_candidates.append((item, toks))
+            dairy_candidates = [
+                (item, toks) for item, toks in candidates
+                if (getattr(item, "allergens", {}) or {}).get("contains_milk", False)
+            ]
             if dairy_candidates:
                 candidates = dairy_candidates
 
         if len(candidates) == 1:
             return candidates[0][0]
 
-        # 3) Prefer items with minimal "extra" tokens (ignoring brands)
+        # 3) Minimal extra tokens (existing logic)
         BRAND_TOKENS = {"starbucks", "costa", "express"}
 
         if len(recognised_tokens) == 1:
@@ -2660,7 +2787,6 @@ class DialogueManager:
             if extra_token_count(toks) == min_extra
         ]
 
-        # 4) Stable fallback: just pick the first among the "best"
         return best[0][0]
 
 
@@ -2689,7 +2815,7 @@ class DialogueManager:
         veg = getattr(item, "suitable_vegetarian", None)
         vegan = getattr(item, "suitable_vegan", None)
 
-        lines = [f"Allergen info for **{item.name}**:"]
+        lines = [f"Allergen info for {item.name}:"]
 
         if contains:
             lines.append(f"- Contains: {', '.join(contains)}.")
@@ -2709,60 +2835,44 @@ class DialogueManager:
 
     def _answer_item_halal(self, item: MenuItem) -> str:
         """
-        Item-specific halal answer built on top of the usual allergen output.
+        Item-specific halal answer with clear visual hierarchy.
+        Verdict FIRST, then details.
         """
-        base_text = self._format_item_allergen_answer(item)
         flags = self._get_halal_flags(item)
 
-        lines: List[str] = [base_text, ""]
-
+        # 1. Determine Headline and Reason
         if flags["halal_friendly"]:
-            # For things like Signature Grilled Cheese Toastie, Cheese & Marmite Mini Ciabatta, Cortado, etc.
-            lines.append(
-                "In our menu data this item is flagged as **halal-friendly** "
-                "(no pork or alcohol ingredients listed in the official allergen/food guide we used)."
-            )
-
+            verdict = "✅ Halal-friendly"
+            reason = "This item is explicitly tagged as halal-friendly in our data."
         elif flags["non_halal"]:
+            verdict = "❌ Not Halal-friendly"
             if flags["has_pork"]:
-                reason = (
-                    "because it includes pork-derived ingredients "
-                    "(for example bacon / ham / sausage) in our source data."
-                )
+                reason = "Contains pork ingredients (e.g. bacon, ham, sausage)."
             elif flags["has_alcohol"]:
-                reason = (
-                    "because it includes ingredients that are typically considered "
-                    "non-halal (for example alcohol) in our source data."
-                )
+                reason = "Contains alcohol ingredients."
             else:
-                reason = "based on the ingredient notes in our menu data."
-
-            lines.append(
-                f"In our menu data this item is listed as **not halal-friendly**, {reason}"
-            )
-
+                reason = "Contains ingredients flagged as non-halal."
         elif flags["vegan_hint"]:
-            # e.g. Costa Express Americano (black), vegan drinks/foods
-            lines.append(
-                "By ingredients in our menu data, this item is **vegan** (no meat or dairy). "
-                "Many halal-conscious customers treat vegan items as safe choices, "
-                "but this is not a formal halal certification."
-            )
-
+            verdict = "🌿 Likely Halal-friendly (Vegan)"
+            reason = "Contains no meat, dairy, or animal products."
         else:
-            lines.append(
-                "We don’t have an explicit halal label for this item. "
-                "Based on our data, it does not list pork or alcohol, "
-                "but we can’t guarantee full halal compliance."
-            )
+            verdict = "⚠️ No Explicit Halal Tag"
+            reason = "No pork/alcohol listed, but we don't have a specific halal certification on file."
 
-        lines.append(
-            "Please treat this as approximate ingredient guidance only – it is **not** a religious fatwa. "
-            "For strict halal decisions, always check the latest official allergen/nutrition guides, "
-            "product packaging, or ask staff / a trusted scholar."
+        # 2. Get Standard Allergen Info (stripped of the introductory line to save space)
+        allergen_full = self._format_item_allergen_answer(item)
+        # Remove the "Allergen info for Item:" line if it exists to merge cleanly
+        allergen_lines = allergen_full.split("\n")[1:]
+        allergen_summary = "\n".join(allergen_lines)
+
+        # 3. Construct Response
+        return (
+            f"{verdict}: {item.name}\n"
+            f"{reason}\n\n"
+            f"Details:\n"
+            f"{allergen_summary}\n\n"
+            "_Note: Based on ingredients in our system. Always verify with packaging/staff for strict religious requirements._"
         )
-
-        return "\n".join(lines)
 
 
     def _get_halal_flags(self, item: MenuItem) -> dict:
@@ -2826,6 +2936,7 @@ class DialogueManager:
         before_bot = self.state.bot_name
         before_cart = list(self.state.cart)
         before_pending = (self.state.awaiting_item_for_pending_options, list(self.state.pending_options_queue))
+        before_flags = set(self.state.dietary_flags)
 
         entry = self.state.undo_stack.pop()
         self.state.restore_snapshot(entry.snapshot)
@@ -2837,6 +2948,8 @@ class DialogueManager:
             changes.append(f"bot name → {self.state.bot_name}")
         if list(self.state.cart) != before_cart:
             changes.append("cart reverted")
+        if self.state.dietary_flags != before_flags:
+            changes.append("dietary preference reverted")
         if (self.state.awaiting_item_for_pending_options, list(self.state.pending_options_queue)) != before_pending:
             changes.append("customisations step reverted")
 
