@@ -181,6 +181,9 @@ class DialogueManager:
         if "what can you do" in lowered or "what do you do" in lowered:
             return self._handle_capabilities(raw)
 
+        if self._looks_like_remove_request(raw):
+            return self._handle_remove_from_cart(raw)
+
         if re.search(r"\bput\b.+\b(basket|cart|order)\b", lowered):
             return self._handle_add_to_cart(raw)
 
@@ -231,7 +234,12 @@ class DialogueManager:
         # 4) Intent detection
         intent_label, confidence = self.intent_classifier.predict_intent(raw)
 
-        # NEW: override misclassified calorie math expressions
+        # if classifier calls it ADD but it clearly says remove, force REMOVE
+        if intent_label == IntentLabel.ADD_TO_CART and self._looks_like_remove_request(raw):
+            intent_label = IntentLabel.REMOVE_FROM_CART
+            confidence = 1.0
+
+        # override misclassified calorie math expressions
         # e.g. "Latte grande + vanilla × 2" should be ASK_CALORIES, not ADD_TO_CART
         if self._looks_like_calorie_expression(raw):
             intent_label = IntentLabel.ASK_CALORIES
@@ -1124,106 +1132,125 @@ class DialogueManager:
         if not self.state.cart:
             return "Your cart is currently empty."
 
-        # 1) Bulk clear-cart commands: "delete all items", "clear cart", "remove everything", etc.
+        # 1) Bulk clear-cart commands
         if self._is_clear_cart_command(lowered):
             self._push_undo("clear cart")
             self.state.cart.clear()
             return "Your cart is now empty."
 
-        # 2) Try to match a specific menu item name in the text.
-        item = self._find_menu_item_in_text(user_text)
+        # If user says "all/everything" with an item, remove all matching lines (or all of a specific config)
+        remove_all = bool(re.search(r"\b(all|everything)\b", lowered))
+
+        # 2) Match item (use relaxed fallback so copied cart text like "× 1" doesn't break)
+        item = self._find_menu_item_in_text(user_text) or self._find_menu_item_in_text_relaxed(user_text)
 
         if item is None:
-            # 2a) Fallback: if there is only *one distinct line* in the cart,
-            #     interpret this as "remove one of whatever is in there",
-            #     unless the user clearly asked to remove *all*.
+            # If only one line exists, keep your old convenience behaviour
             if len(self.state.cart) == 1:
                 line = self.state.cart[0]
                 self._push_undo("remove from cart")
 
-                # If they explicitly mentioned "all" / "everything", drop the whole line.
-                if re.search(r"\b(all|everything)\b", lowered):
+                if remove_all or line.quantity == 1:
                     removed = self.state.cart.pop()
                     return f"Removed {removed.item_name} from your cart."
 
-                # If quantity > 1: decrement instead of wiping it out.
-                if line.quantity > 1:
-                    # If they say "one" / "1", be explicit
-                    if re.search(r"\b(one|1)\b", lowered):
-                        line.quantity -= 1
-                        return f"Removed one {line.item_name} from your cart."
-                    # Default behaviour: still just remove one
-                    line.quantity -= 1
-                    return f"Removed one {line.item_name} from your cart."
+                line.quantity -= 1
+                return f"Removed one {line.item_name} from your cart."
 
-                # quantity == 1 → safe to remove completely
-                removed = self.state.cart.pop()
-                return f"Removed {removed.item_name} from your cart."
-
-            # 2b) More than one distinct line in the cart and we couldn't match an item
             return (
                 "I couldn’t work out which item to remove. "
                 "Please mention the drink or food name that’s in your cart."
             )
 
-        # 3) We matched a specific menu item → remove from that line only
-        target_base = self._base_item_name(item.name)
+        # 3) Extract options from the remove command (so: "remove latte with extra shot" works)
+        remainder = self._strip_item_mention_for_options(user_text, item)
+        option_pairs = self._parse_options_from_text(remainder, base_item=item)
 
-        def same_base(line: CartLine) -> bool:
-            return self._base_item_name(line.item_name) == target_base
+        expanded_opts = []
+        for opt, qty in option_pairs:
+            for _ in range(max(int(qty), 1)):
+                expanded_opts.append(opt)
 
-        will_remove = any(line.item_id == item.item_id for line in self.state.cart)
-        if not will_remove:
+        # enforce same scope/single-choice rules as add_to_cart
+        from types import SimpleNamespace
+        tmp = SimpleNamespace(options=[])
+        self._apply_options_to_line(tmp, expanded_opts, item)
+        desired_option_ids = [o.option_id for o in tmp.options]
+
+        # 4) Find all cart lines that match the base item_id
+        candidates = [line for line in self.state.cart if line.item_id == item.item_id]
+
+        # Fallback: if item_id didn’t match but base name matches exactly one line
+        if not candidates:
+            target_base = self._base_item_name(item.name)
+
+            def same_base(line: CartLine) -> bool:
+                return self._base_item_name(line.item_name) == target_base
+
             base_matches = [line for line in self.state.cart if same_base(line)]
-            will_remove = (len(base_matches) == 1)
+            if len(base_matches) == 1:
+                candidates = base_matches
 
-        if will_remove:
-            self._push_undo("remove from cart")
+        if not candidates:
+            return f"I can’t find {item.name} in your cart."
+
+        # 5) If user specified options, match that specific configuration
+        if desired_option_ids:
+            def same_config(line: CartLine) -> bool:
+                return sorted(getattr(line, "selected_options", []) or []) == sorted(desired_option_ids)
+
+            candidates = [line for line in candidates if same_config(line)]
+
+            if not candidates:
+                # Helpful hint showing what variants exist
+                variants = []
+                for line in [l for l in self.state.cart if l.item_id == item.item_id]:
+                    opts = self._format_options_summary(getattr(line, "selected_options", []) or [])
+                    variants.append(f"- {line.item_name} ({opts})" if opts else f"- {line.item_name}")
+                hint = "\n".join(variants) if variants else ""
+                return (
+                    f"I found {item.name} in your cart, but not with those customisations.\n"
+                    "Here are the versions currently in your cart:\n"
+                    f"{hint}"
+                )
+
+        # 6) If still multiple candidates and user gave no options, don't delete all — remove ONE deterministically
+        # Choose the most recently added matching line (the last one in the cart list).
+        target_line = candidates[-1]
+
+        # 7) Apply removal (ONE line only)
+        self._push_undo("remove from cart")
 
         new_cart: List[CartLine] = []
         removed_any = False
-        removed_name: Optional[str] = None
 
-        # First pass: try exact item_id match
         for line in self.state.cart:
-            if line.item_id == item.item_id:
+            if not removed_any and line is target_line:
                 removed_any = True
-                removed_name = line.item_name
+
+                if remove_all:
+                    # remove the whole line regardless of quantity
+                    continue
+
                 if line.quantity > 1:
                     line.quantity -= 1
                     new_cart.append(line)
-                # quantity == 1 → drop the line
+                # else quantity == 1 -> drop line
             else:
                 new_cart.append(line)
 
-        # If no exact match, but exactly one cart line shares the same base name
-        if not removed_any:
-            # restore original cart to try base-name removal
-            new_cart = []
-            base_matches = [line for line in self.state.cart if same_base(line)]
-
-            if len(base_matches) == 1:
-                match_id = base_matches[0].item_id
-                for line in self.state.cart:
-                    if line.item_id == match_id:
-                        removed_any = True
-                        removed_name = line.item_name
-                        if line.quantity > 1:
-                            line.quantity -= 1
-                            new_cart.append(line)
-                        # quantity == 1 → drop this line
-                    else:
-                        new_cart.append(line)
-
         self.state.cart = new_cart
 
-        if not removed_any:
-            return (
-                "I couldn’t work out which item to remove. "
-                "Please mention the drink or food name that’s in your cart."
-            )
+        # 8) Response text (include options if present so user sees which one got removed)
+        removed_opts = self._format_options_summary(getattr(target_line, "selected_options", []) or [])
+        if remove_all:
+            if removed_opts:
+                return f"Removed {target_line.item_name} ({removed_opts}) from your cart."
+            return f"Removed {target_line.item_name} from your cart."
 
-        return f"Removed one {removed_name} from your cart."
+        if removed_opts:
+            return f"Removed one {target_line.item_name} ({removed_opts}) from your cart."
+        return f"Removed one {target_line.item_name} from your cart."
 
     def _handle_show_cart(self, _: str) -> str:
         if not self.state.cart:
@@ -1825,7 +1852,6 @@ class DialogueManager:
 
         for seg in segments:
             seg_tokens = self._tokenise_for_matching(seg)
-            print("SEG:", seg, "TOKENS:", seg_tokens)
             if not seg_tokens:
                 continue
 
@@ -2187,6 +2213,31 @@ class DialogueManager:
 
         # Check if any menu item name is present
         return self._find_menu_item_in_text_relaxed(text) is not None
+
+    def _looks_like_remove_request(self, raw: str) -> bool:
+        t = (raw or "").strip().lower()
+        if not t:
+            return False
+
+        # Clear-cart is still "remove flow" (handler will decide bulk vs single)
+        if self._is_clear_cart_command(t):
+            return True
+
+        # Strong cues (start-of-utterance), including polite prefixes
+        # Examples: "remove latte", "please remove latte", "can you delete latte"
+        if re.search(r"^\s*(?:please\s+)?(?:can you\s+|could you\s+)?(?:remove|delete|drop)\b", t):
+            return True
+
+        # "take X out/off (of my cart)" patterns
+        if re.search(r"\b(take\s+(?:it|this|that|\w+)\s+(?:out|off))\b", t):
+            # only treat as remove if it looks like a menu item is mentioned
+            return self._find_menu_item_in_text_relaxed(raw) is not None
+
+        # If the user explicitly says "remove" anywhere + mentions cart/basket/order, treat as remove
+        if "remove" in t and any(w in t for w in ["cart", "basket", "order"]):
+            return True
+
+        return False
 
     def _answer_calorie_simple(self, user_text: str) -> str:
         """
