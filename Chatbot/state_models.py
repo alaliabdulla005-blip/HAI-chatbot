@@ -4,7 +4,6 @@ from typing import List, Optional, Dict, Any
 from collections import deque
 from typing import Deque
 from copy import deepcopy
-from .domain_models import MenuItem, MenuOption  # if needed
 
 @dataclass
 class CartLine:
@@ -69,6 +68,10 @@ class ChatState(ConversationState):
     awaiting_item_for_pending_options: bool = False
     pending_options_queue: Deque[str] = field(default_factory=deque)
     undo_stack: List[UndoEntry] = field(default_factory=list)
+    last_referenced_line_id: Optional[str] = None
+    awaiting_disambiguation: bool = False
+    disambiguation_candidates: List[str] = field(default_factory=list)
+    disambiguation_reason: Optional[str] = None
 
     def make_snapshot(self) -> ChatStateSnapshot:
         return ChatStateSnapshot(

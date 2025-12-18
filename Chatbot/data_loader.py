@@ -246,6 +246,14 @@ def load_option_items(path: Optional[Path] = None) -> List[MenuOption]:
 
     return options
 
+def load_option_items_by_id(path: Optional[Path] = None) -> Dict[str, MenuOption]:
+    """
+    Convenience loader: options.csv -> dict keyed by option_id.
+
+    This is what DialogueManager (and matching logic) should use for quick lookups.
+    """
+    options = load_option_items(path)
+    return {opt.option_id: opt for opt in options}
 
 # ---------- faqs.csv ----------
 

@@ -5,8 +5,7 @@ FAQ search module.
 - Builds a TF–IDF index over questions (and optionally answers).
 - Supports similarity-based lookup with optional tag filters.
 
-This is a simple IR component, not an LLM. All wording comes from
-answer_markdown in faqs.csv.
+This is a simple IR component.
 """
 
 from __future__ import annotations

@@ -201,6 +201,22 @@ espresso,add_to_cart
 hot chocolate,add_to_cart
 flat white,add_to_cart
 cortado,add_to_cart
+2 large cappuccinos,add_to_cart
+1 latte,add_to_cart
+two flat whites,add_to_cart
+three muffins,add_to_cart
+large latte with oat milk,add_to_cart
+grande cappuccino,add_to_cart
+a croissant,add_to_cart
+I'll take a mocha,add_to_cart
+can i get 2 espressos,add_to_cart
+2 large cappuccinos,add_to_cart
+two lattes please,add_to_cart
+3 x mocha,add_to_cart
+one espresso,add_to_cart
+2 flat whites,add_to_cart
+large latte with oat milk,add_to_cart
+1 blueberry muffin,add_to_cart
 remove the blueberry muffin from my cart,remove_from_cart
 delete that item,remove_from_cart
 take the coffee out,remove_from_cart

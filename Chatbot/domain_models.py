@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from collections import deque
 
 
@@ -180,6 +180,26 @@ class MenuOption:
     suitable_vegan_delta: Optional[str] = None
 
     notes: str = ""
+
+    def scope_rules(self) -> List[Tuple[str, str]]:
+        """
+        Parse applies_to_scope like:
+          - "category:Beverage"
+          - "item_id:a|item_id:b|item_id:c"
+
+        Returns a list of (key, value) pairs.
+        """
+        raw = (self.applies_to_scope or "").strip()
+        if not raw:
+            return []
+        parts = [p.strip() for p in raw.split("|") if p.strip()]
+        rules: List[Tuple[str, str]] = []
+        for p in parts:
+            if ":" in p:
+                k, v = p.split(":", 1)
+                rules.append((k.strip(), v.strip()))
+        return rules
+
 
 # ---------- Intent / FAQ-related light models ----------
 

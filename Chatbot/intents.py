@@ -5,8 +5,6 @@ Intent detection module.
 - Trains a TF–IDF + LogisticRegression classifier (scikit-learn).
 - Saves / loads the fitted vectorizer + classifier from .pkl files.
 - Exposes a small API the rest of the chatbot can call.
-
-CW-friendly: uses only allowed libraries (stdlib + scikit-learn).
 """
 
 from __future__ import annotations
